@@ -32,6 +32,7 @@ use datafusion_expr::{
     Volatility,
 };
 use datafusion_macros::user_doc;
+use memchr::memmem;
 
 #[user_doc(
     doc_section(label = "String Functions"),
@@ -205,21 +206,28 @@ where
                     if substring.is_empty() {
                         T::Native::from_usize(1)
                     } else {
-                        T::Native::from_usize(
-                            string
-                                .as_bytes()
-                                .windows(substring.len())
-                                .position(|w| w == substring.as_bytes())
-                                .map(|x| x + 1)
-                                .unwrap_or(0),
-                        )
+                        if string.len() > 128 {
+                            T::Native::from_usize(
+                                string
+                                    .as_bytes()
+                                    .windows(substring.len())
+                                    .position(|window| window == substring.as_bytes())
+                                    .map(|x| x + 1)
+                                    .unwrap_or(0),
+                            )
+                        } else {
+                            T::Native::from_usize(
+                                memmem::find(string.as_bytes(), substring.as_bytes())
+                                    .map(|x| x + 1)
+                                    .unwrap_or(0),
+                            )
+                        }
                     }
                 } else {
                     // The `find` method returns the byte index of the substring.
                     // We count the number of chars up to that byte index.
                     T::Native::from_usize(
-                        string
-                            .find(substring)
+                        memmem::find(string.as_bytes(), substring.as_bytes())
                             .map(|x| string[..x].chars().count() + 1)
                             .unwrap_or(0),
                     )
