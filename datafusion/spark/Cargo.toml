@@ -53,6 +53,7 @@ log = { workspace = true }
 percent-encoding = "2.3.2"
 rand = { workspace = true }
 sha1 = "0.10"
+sha2 = "0.10"
 url = { workspace = true }
 
 [dev-dependencies]
@@ -61,3 +62,7 @@ criterion = { workspace = true }
 [[bench]]
 harness = false
 name = "char"
+
+[[bench]]
+harness = false
+name = "sha2"

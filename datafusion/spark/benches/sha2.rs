@@ -15,14 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-use arrow::{array::{Int32Array, StringArray}, datatypes::{DataType, Field}};
-use criterion::{Criterion, criterion_group, criterion_main, BenchmarkId};
+use arrow::{
+    array::{Int32Array, StringArray},
+    datatypes::{DataType, Field},
+};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::config::ConfigOptions;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs};
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use std::sync::Arc;
 
-fn prepare_sha2_args(size: usize, bit_len: i32, config_options: Arc<ConfigOptions>) -> ScalarFunctionArgs {
+fn prepare_sha2_args(
+    size: usize,
+    bit_len: i32,
+    config_options: Arc<ConfigOptions>,
+) -> ScalarFunctionArgs {
     let mut rng = StdRng::seed_from_u64(42);
     let null_density = 0.2;
 
@@ -65,7 +72,7 @@ fn prepare_sha2_args(size: usize, bit_len: i32, config_options: Arc<ConfigOption
 fn criterion_benchmark(c: &mut Criterion) {
     let sha2_fn = datafusion_spark::function::hash::sha2();
     let config_options = Arc::new(ConfigOptions::default());
-    
+
     let sizes = [1024, 2048, 4096];
     let bit_lengths = [224, 256, 384, 512];
 
@@ -75,14 +82,12 @@ fn criterion_benchmark(c: &mut Criterion) {
         for size in sizes {
             // 构造参数
             let bench_args = prepare_sha2_args(size, bit_len, config_options.clone());
-            
+
             // 构造 Benchmark ID，例如 "SHA2-256/1024"
             let id = BenchmarkId::new(format!("SHA2-{}", bit_len), size);
 
             group.bench_with_input(id, &bench_args, |b, args| {
-                b.iter(|| {
-                    sha2_fn.invoke_with_args(args.clone()).unwrap()
-                })
+                b.iter(|| sha2_fn.invoke_with_args(args.clone()).unwrap())
             });
         }
     }
