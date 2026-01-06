@@ -155,6 +155,9 @@ pub fn sha2(args: [ColumnarValue; 2]) -> Result<ColumnarValue> {
             let len = bit_array.len();
             let input_array = input_values.into_array(len)?;
 
+            // Pre-allocate capacity assuming SHA-256 (64 hex chars per output); 
+            // actual usage may be less for SHA-224 or more for SHA-384/512, 
+            // but this provides a reasonable default for mixed or unknown cases.
             let mut builder = StringBuilder::with_capacity(len, len * 64);
 
             for i in 0..len {
@@ -164,7 +167,7 @@ pub fn sha2(args: [ColumnarValue; 2]) -> Result<ColumnarValue> {
                 }
 
                 if let Some(algo) = DigestAlgorithm::from_bits(bit_array.value(i)) {
-                    let bytes = get_bytes_at(&input_array, i);
+                    let bytes = get_bytes_at(&input_array, i)?;
                     builder.append_value(algo.compute_and_hex(bytes));
                 } else {
                     builder.append_null();
@@ -228,16 +231,20 @@ fn hex_encode_lower<T: AsRef<[u8]>>(data: T) -> String {
     String::from_utf8(output).unwrap()
 }
 
-fn get_bytes_at(array: &ArrayRef, i: usize) -> &[u8] {
-    match array.data_type() {
+fn get_bytes_at(array: &ArrayRef, i: usize) -> Result<&[u8]> {
+    Ok(match array.data_type() {
         DataType::Utf8 => array.as_string::<i32>().value(i).as_bytes(),
         DataType::LargeUtf8 => array.as_string::<i64>().value(i).as_bytes(),
         DataType::Utf8View => array.as_string_view().value(i).as_bytes(),
         DataType::Binary => array.as_binary::<i32>().value(i),
         DataType::LargeBinary => array.as_binary::<i64>().value(i),
         DataType::BinaryView => array.as_binary_view().value(i),
-        _ => &[],
-    }
+        _ => {
+            return exec_err!(
+                "sha2 function can only accept strings or binary arrays."
+            );
+        }
+    })
 }
 
 fn compute_sha2_bulk(bits: i32, input: &ColumnarValue) -> Result<ColumnarValue> {
@@ -256,7 +263,15 @@ fn compute_sha2_bulk(bits: i32, input: &ColumnarValue) -> Result<ColumnarValue> 
                 ScalarValue::Binary(Some(b))
                 | ScalarValue::LargeBinary(Some(b))
                 | ScalarValue::BinaryView(Some(b)) => Some(b.as_slice()),
-                _ => None,
+                ScalarValue::LargeUtf8(None)
+                | ScalarValue::Utf8(None)
+                | ScalarValue::Utf8View(None)
+                | ScalarValue::Binary(None)
+                | ScalarValue::LargeBinary(None)
+                | ScalarValue::BinaryView(None) => None,
+                _ => return exec_err!(
+                    "sha2 function can only accept strings or binary arrays."
+                ),
             };
             let res = bytes.map(|b| algo.compute_and_hex(b));
             Ok(ColumnarValue::Scalar(ScalarValue::Utf8(res)))
@@ -269,11 +284,169 @@ fn compute_sha2_bulk(bits: i32, input: &ColumnarValue) -> Result<ColumnarValue> 
                 if array.is_null(i) {
                     builder.append_null();
                 } else {
-                    let bytes = get_bytes_at(array, i);
+                    let bytes = get_bytes_at(array, i)?;
                     builder.append_value(algo.compute_and_hex(bytes));
                 }
             }
             Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::{array::{Int32Array, StringArray}, datatypes::Field};
+    use datafusion_common::{config::ConfigOptions};
+    use datafusion_expr::ColumnarValue;
+
+    fn make_function_args(
+        input: ColumnarValue,
+        bits: ColumnarValue,
+        number_rows: usize,
+    ) -> ScalarFunctionArgs {
+        ScalarFunctionArgs {
+            args: vec![input, bits],
+            arg_fields: vec![],
+            number_rows,
+            return_field: Arc::new(Field::new("res", DataType::Utf8, true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        }
+    }
+
+#[test]
+    fn test_scalar_scalar_valid() {
+        let func = SparkSha2::new();
+        let args = make_function_args(
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("hello".to_string()))),
+            ColumnarValue::Scalar(ScalarValue::Int32(Some(256))),
+            1,
+        );
+
+        let result = func.invoke_with_args(args).unwrap();
+        match result {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(res))) => {
+                assert_eq!(res, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+            }
+            _ => panic!("Expected scalar result"),
+        }
+    }
+
+    #[test]
+    fn test_scalar_scalar_invalid_bits() {
+        let func = SparkSha2::new();
+        let args = make_function_args(
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("hello".to_string()))),
+            ColumnarValue::Scalar(ScalarValue::Int32(Some(123))),
+            1,
+        );
+
+        let result = func.invoke_with_args(args).unwrap();
+        match result {
+            ColumnarValue::Scalar(ScalarValue::Utf8(None)) => {}
+            _ => panic!("Expected null result for invalid bits"),
+        }
+    }
+
+    #[test]
+    fn test_scalar_array_bits() {
+        let func = SparkSha2::new();
+        let bits: ArrayRef = Arc::new(Int32Array::from(vec![Some(256), None]));
+        let args = make_function_args(
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("hello".to_string()))),
+            ColumnarValue::Array(bits),
+            2,
+        );
+
+        let result = func.invoke_with_args(args).unwrap();
+        match result {
+            ColumnarValue::Array(arr) => {
+                let arr = arr.as_string::<i32>();
+                assert!(!arr.is_null(0));
+                assert!(arr.is_null(1));
+            }
+            _ => panic!("Expected array result"),
+        }
+    }
+
+    #[test]
+    fn test_array_scalar_bits() {
+        let func = SparkSha2::new();
+        let input: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("hello"),
+            None,
+            Some("world"),
+        ]));
+        let args = make_function_args(
+            ColumnarValue::Array(input),
+            ColumnarValue::Scalar(ScalarValue::Int32(Some(256))),
+            3,
+        );
+
+        let result = func.invoke_with_args(args).unwrap();
+        match result {
+            ColumnarValue::Array(arr) => {
+                let arr = arr.as_string::<i32>();
+                assert_eq!(
+                    arr.value(0),
+                    "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                );
+                assert!(arr.is_null(1));
+                assert_eq!(
+                    arr.value(2),
+                    "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7"
+                );
+            }
+            _ => panic!("Expected array result"),
+        }
+    }
+
+    #[test]
+    fn test_array_array_bits() {
+        let func = SparkSha2::new();
+        let input: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("hello"),
+            Some("world"),
+            None,
+        ]));
+        let bits: ArrayRef = Arc::new(Int32Array::from(vec![Some(256), Some(224), Some(256)]));
+        let args = make_function_args(
+            ColumnarValue::Array(input),
+            ColumnarValue::Array(bits),
+            3,
+        );
+
+        let result = func.invoke_with_args(args).unwrap();
+        match result {
+            ColumnarValue::Array(arr) => {
+                let arr = arr.as_string::<i32>();
+                assert!(!arr.is_null(0));
+                assert_eq!(arr.value(1).len(), 56); // sha224
+                assert!(arr.is_null(2));
+            }
+            _ => panic!("Expected array result"),
+        }
+    }
+
+    #[test]
+    fn test_array_array_bits_with_nulls() {
+        let func = SparkSha2::new();
+        let input: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), Some("b")]));
+        let bits: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(256)]));
+        let args = make_function_args(
+            ColumnarValue::Array(input),
+            ColumnarValue::Array(bits),
+            2,
+        );
+
+        let result = func.invoke_with_args(args).unwrap();
+        match result {
+            ColumnarValue::Array(arr) => {
+                let arr = arr.as_string::<i32>();
+                assert!(arr.is_null(0));
+                assert!(!arr.is_null(1));
+            }
+            _ => panic!("Expected array result"),
         }
     }
 }
