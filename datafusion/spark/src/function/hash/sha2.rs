@@ -20,7 +20,6 @@ extern crate datafusion_functions;
 use crate::function::error_utils::{
     invalid_arg_count_exec_err, unsupported_data_type_exec_err,
 };
-use crate::function::math::hex;
 use arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use arrow::datatypes::{DataType, Int32Type};
 use datafusion_common::{Result, ScalarValue, exec_err, internal_datafusion_err};
@@ -156,10 +155,10 @@ pub fn sha2(args: [ColumnarValue; 2]) -> Result<ColumnarValue> {
 
             let mut total_bytes = 0;
             for i in 0..len {
-                if !bit_array.is_null(i) {
-                    if let Some(algo) = Sha2DigestAlgorithm::from_bits(bit_array.value(i)) {
-                        total_bytes += algo.hex_length();
-                    }
+                if !bit_array.is_null(i)
+                    && let Some(algo) = Sha2DigestAlgorithm::from_bits(bit_array.value(i))
+                {
+                    total_bytes += algo.hex_length();
                 }
             }
 
@@ -243,7 +242,7 @@ const HEX_CHARS_LOWER: &[u8; 16] = b"0123456789abcdef";
 
 #[inline]
 fn hex_encode(data: &[u8], output: &mut String) {
-    for &byte in data{
+    for &byte in data {
         output.push(HEX_CHARS_LOWER[(byte >> 4) as usize] as char);
         output.push(HEX_CHARS_LOWER[(byte & 0x0F) as usize] as char);
     }
@@ -261,7 +260,7 @@ fn get_bytes_at(array: &ArrayRef, i: usize) -> Result<&[u8]> {
             return exec_err!(
                 "sha2 input must be Utf8 / Binary (got {:?})",
                 array.data_type()
-            )
+            );
         }
     })
 }
