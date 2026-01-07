@@ -20,9 +20,8 @@ extern crate datafusion_functions;
 use crate::function::error_utils::{
     invalid_arg_count_exec_err, unsupported_data_type_exec_err,
 };
-use arrow::array::{
-    Array, ArrayRef, AsArray, StringBuilder,
-};
+use crate::function::math::hex;
+use arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use arrow::datatypes::{DataType, Int32Type};
 use datafusion_common::{Result, ScalarValue, exec_err, internal_datafusion_err};
 use datafusion_expr::Signature;
@@ -155,20 +154,30 @@ pub fn sha2(args: [ColumnarValue; 2]) -> Result<ColumnarValue> {
             let len = bit_array.len();
             let input_array = input_values.into_array(len)?;
 
-            // Pre-allocate capacity assuming SHA-256 (64 hex chars per output); 
-            // actual usage may be less for SHA-224 or more for SHA-384/512, 
-            // but this provides a reasonable default for mixed or unknown cases.
-            let mut builder = StringBuilder::with_capacity(len, len * 64);
+            let mut total_bytes = 0;
+            for i in 0..len {
+                if !bit_array.is_null(i) {
+                    if let Some(algo) = Sha2DigestAlgorithm::from_bits(bit_array.value(i)) {
+                        total_bytes += algo.hex_length();
+                    }
+                }
+            }
 
+            let mut builder = StringBuilder::with_capacity(len, total_bytes);
+
+            let mut hex_string_cache = String::new();
             for i in 0..len {
                 if bit_array.is_null(i) || input_array.is_null(i) {
                     builder.append_null();
                     continue;
                 }
 
-                if let Some(algo) = DigestAlgorithm::from_bits(bit_array.value(i)) {
+                if let Some(algo) = Sha2DigestAlgorithm::from_bits(bit_array.value(i)) {
+                    hex_string_cache.clear();
+                    hex_string_cache.reserve(algo.hex_length());
                     let bytes = get_bytes_at(&input_array, i)?;
-                    builder.append_value(algo.compute_and_hex(bytes));
+                    algo.compute_and_hex(bytes, &mut hex_string_cache);
+                    builder.append_value(&hex_string_cache);
                 } else {
                     builder.append_null();
                 }
@@ -180,25 +189,26 @@ pub fn sha2(args: [ColumnarValue; 2]) -> Result<ColumnarValue> {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-enum DigestAlgorithm {
+enum Sha2DigestAlgorithm {
     Sha224,
     Sha256,
     Sha384,
     Sha512,
 }
 
-impl DigestAlgorithm {
+impl Sha2DigestAlgorithm {
     fn hex_length(&self) -> usize {
         match self {
-            DigestAlgorithm::Sha224 => 56,
-            DigestAlgorithm::Sha256 => 64,
-            DigestAlgorithm::Sha384 => 96,
-            DigestAlgorithm::Sha512 => 128,
+            Sha2DigestAlgorithm::Sha224 => 56,
+            Sha2DigestAlgorithm::Sha256 => 64,
+            Sha2DigestAlgorithm::Sha384 => 96,
+            Sha2DigestAlgorithm::Sha512 => 128,
         }
     }
 
     fn from_bits(bits: i32) -> Option<Self> {
         match bits {
+            // Spark compatibility: bit length 0 defaults to SHA-256
             0 | 256 => Some(Self::Sha256),
             224 => Some(Self::Sha224),
             384 => Some(Self::Sha384),
@@ -207,28 +217,36 @@ impl DigestAlgorithm {
         }
     }
 
-    fn compute_and_hex(&self, bytes: &[u8]) -> String {
-        let digest = match self {
-            Self::Sha224 => Sha224::digest(bytes).to_vec(),
-            Self::Sha256 => Sha256::digest(bytes).to_vec(),
-            Self::Sha384 => Sha384::digest(bytes).to_vec(),
-            Self::Sha512 => Sha512::digest(bytes).to_vec(),
-        };
-        hex_encode_lower(digest)
+    fn compute_and_hex(&self, bytes: &[u8], output: &mut String) {
+        match self {
+            Self::Sha224 => {
+                let d = Sha224::digest(bytes);
+                hex_encode(&d, output);
+            }
+            Self::Sha256 => {
+                let d = Sha256::digest(bytes);
+                hex_encode(&d, output);
+            }
+            Self::Sha384 => {
+                let d = Sha384::digest(bytes);
+                hex_encode(&d, output);
+            }
+            Self::Sha512 => {
+                let d = Sha512::digest(bytes);
+                hex_encode(&d, output);
+            }
+        }
     }
 }
 
 const HEX_CHARS_LOWER: &[u8; 16] = b"0123456789abcdef";
 
 #[inline]
-fn hex_encode_lower<T: AsRef<[u8]>>(data: T) -> String {
-    let input = data.as_ref();
-    let mut output = vec![0u8; input.len() * 2];
-    for (i, &byte) in input.iter().enumerate() {
-        output[i * 2] = HEX_CHARS_LOWER[(byte >> 4) as usize];
-        output[i * 2 + 1] = HEX_CHARS_LOWER[(byte & 0x0F) as usize];
+fn hex_encode(data: &[u8], output: &mut String) {
+    for &byte in data{
+        output.push(HEX_CHARS_LOWER[(byte >> 4) as usize] as char);
+        output.push(HEX_CHARS_LOWER[(byte & 0x0F) as usize] as char);
     }
-    String::from_utf8(output).unwrap()
 }
 
 fn get_bytes_at(array: &ArrayRef, i: usize) -> Result<&[u8]> {
@@ -241,14 +259,15 @@ fn get_bytes_at(array: &ArrayRef, i: usize) -> Result<&[u8]> {
         DataType::BinaryView => array.as_binary_view().value(i),
         _ => {
             return exec_err!(
-                "sha2 function can only accept strings or binary arrays."
-            );
+                "sha2 input must be Utf8 / Binary (got {:?})",
+                array.data_type()
+            )
         }
     })
 }
 
 fn compute_sha2_bulk(bits: i32, input: &ColumnarValue) -> Result<ColumnarValue> {
-    let algo = match DigestAlgorithm::from_bits(bits) {
+    let algo = match Sha2DigestAlgorithm::from_bits(bits) {
         Some(a) => a,
         None => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
     };
@@ -269,23 +288,33 @@ fn compute_sha2_bulk(bits: i32, input: &ColumnarValue) -> Result<ColumnarValue> 
                 | ScalarValue::Binary(None)
                 | ScalarValue::LargeBinary(None)
                 | ScalarValue::BinaryView(None) => None,
-                _ => return exec_err!(
-                    "sha2 function can only accept strings or binary arrays."
-                ),
+                _ => {
+                    return exec_err!(
+                        "sha2 function can only accept strings or binary arrays."
+                    );
+                }
             };
-            let res = bytes.map(|b| algo.compute_and_hex(b));
+            let res = bytes.map(|b| {
+                let mut hex_string = String::with_capacity(algo.hex_length());
+                algo.compute_and_hex(b, &mut hex_string);
+                hex_string
+            });
             Ok(ColumnarValue::Scalar(ScalarValue::Utf8(res)))
         }
         ColumnarValue::Array(array) => {
             let len = array.len();
             let mut builder = StringBuilder::with_capacity(len, len * algo.hex_length());
 
+            let mut hex_string_cache = String::new();
             for i in 0..len {
                 if array.is_null(i) {
                     builder.append_null();
                 } else {
+                    hex_string_cache.clear();
+                    hex_string_cache.reserve(algo.hex_length());
                     let bytes = get_bytes_at(array, i)?;
-                    builder.append_value(algo.compute_and_hex(bytes));
+                    algo.compute_and_hex(bytes, &mut hex_string_cache);
+                    builder.append_value(&hex_string_cache);
                 }
             }
             Ok(ColumnarValue::Array(Arc::new(builder.finish())))
@@ -296,8 +325,11 @@ fn compute_sha2_bulk(bits: i32, input: &ColumnarValue) -> Result<ColumnarValue> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::{array::{Int32Array, StringArray}, datatypes::Field};
-    use datafusion_common::{config::ConfigOptions};
+    use arrow::{
+        array::{Int32Array, StringArray},
+        datatypes::Field,
+    };
+    use datafusion_common::config::ConfigOptions;
     use datafusion_expr::ColumnarValue;
 
     fn make_function_args(
@@ -314,7 +346,7 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn test_scalar_scalar_valid() {
         let func = SparkSha2::new();
         let args = make_function_args(
@@ -326,7 +358,10 @@ mod tests {
         let result = func.invoke_with_args(args).unwrap();
         match result {
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(res))) => {
-                assert_eq!(res, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+                assert_eq!(
+                    res,
+                    "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                );
             }
             _ => panic!("Expected scalar result"),
         }
@@ -372,11 +407,8 @@ mod tests {
     #[test]
     fn test_array_scalar_bits() {
         let func = SparkSha2::new();
-        let input: ArrayRef = Arc::new(StringArray::from(vec![
-            Some("hello"),
-            None,
-            Some("world"),
-        ]));
+        let input: ArrayRef =
+            Arc::new(StringArray::from(vec![Some("hello"), None, Some("world")]));
         let args = make_function_args(
             ColumnarValue::Array(input),
             ColumnarValue::Scalar(ScalarValue::Int32(Some(256))),
@@ -404,12 +436,10 @@ mod tests {
     #[test]
     fn test_array_array_bits() {
         let func = SparkSha2::new();
-        let input: ArrayRef = Arc::new(StringArray::from(vec![
-            Some("hello"),
-            Some("world"),
-            None,
-        ]));
-        let bits: ArrayRef = Arc::new(Int32Array::from(vec![Some(256), Some(224), Some(256)]));
+        let input: ArrayRef =
+            Arc::new(StringArray::from(vec![Some("hello"), Some("world"), None]));
+        let bits: ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(256), Some(224), Some(256)]));
         let args = make_function_args(
             ColumnarValue::Array(input),
             ColumnarValue::Array(bits),
