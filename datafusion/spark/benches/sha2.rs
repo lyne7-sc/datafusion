@@ -47,7 +47,6 @@ fn prepare_sha2_args(
         })
         .collect();
 
-    // 根据传入的 bit_len 生成参数列
     let bit_length_array = Arc::new(Int32Array::from(vec![bit_len; size]));
     let args = vec![
         ColumnarValue::Array(Arc::new(input)),
@@ -80,10 +79,8 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     for bit_len in bit_lengths {
         for size in sizes {
-            // 构造参数
             let bench_args = prepare_sha2_args(size, bit_len, config_options.clone());
 
-            // 构造 Benchmark ID，例如 "SHA2-256/1024"
             let id = BenchmarkId::new(format!("SHA2-{bit_len}"), size);
 
             group.bench_with_input(id, &bench_args, |b, args| {
