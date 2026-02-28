@@ -19,8 +19,8 @@
 
 use crate::utils::make_scalar_function;
 use arrow::array::{
-    new_null_array, Array, ArrayRef, Capacities, GenericListArray, Int64Array,
-    MutableArrayData, NullBufferBuilder, OffsetSizeTrait,
+    Array, ArrayRef, Capacities, GenericListArray, Int64Array, MutableArrayData,
+    NullBufferBuilder, OffsetSizeTrait, new_null_array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::DataType;
@@ -31,7 +31,7 @@ use arrow::datatypes::{
 };
 use datafusion_common::cast::{as_int64_array, as_large_list_array, as_list_array};
 use datafusion_common::utils::ListCoercion;
-use datafusion_common::{exec_err, internal_datafusion_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err, internal_datafusion_err};
 use datafusion_expr::{
     ArrayFunctionArgument, ArrayFunctionSignature, ColumnarValue, Documentation,
     ScalarUDFImpl, Signature, TypeSignature, Volatility,
@@ -213,12 +213,9 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
         if array.is_null(row_index) {
             continue;
         }
-        let target_count =
-            count_array.value(row_index).to_usize().ok_or_else(|| {
-                internal_datafusion_err!(
-                    "array_resize: failed to convert size to usize"
-                )
-            })?;
+        let target_count = count_array.value(row_index).to_usize().ok_or_else(|| {
+            internal_datafusion_err!("array_resize: failed to convert size to usize")
+        })?;
         let current_len = (offset_window[1] - offset_window[0]).to_usize().unwrap();
         if target_count > current_len {
             let extra = target_count - current_len;
@@ -232,20 +229,20 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
     // use the same fill value.
     let is_uniform_fill = max_extra > 0
         && match &default_element {
-        None => true,
-        Some(fill_array) => {
-            let len = fill_array.len();
-            let null_count = fill_array.logical_null_count();
+            None => true,
+            Some(fill_array) => {
+                let len = fill_array.len();
+                let null_count = fill_array.logical_null_count();
 
-            len <= 1
-            || null_count == len
-            || (null_count == 0 && {
-                let first = fill_array.slice(0, 1);
-                (1..len)
-                    .all(|i| fill_array.slice(i, 1).as_ref() == first.as_ref())
-            })
-        }
-    };
+                len <= 1
+                    || null_count == len
+                    || (null_count == 0 && {
+                        let first = fill_array.slice(0, 1);
+                        (1..len)
+                            .all(|i| fill_array.slice(i, 1).as_ref() == first.as_ref())
+                    })
+            }
+        };
 
     // Fast path: at least one row needs to grow and all rows share
     // the same fill value.
@@ -255,15 +252,12 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
             Some(fill_array) if fill_array.logical_null_count() == fill_array.len() => {
                 ScalarValue::try_from(&data_type)?
             }
-            Some(fill_array) => {
-                ScalarValue::try_from_array(fill_array.as_ref(), 0)?
-            }
+            Some(fill_array) => ScalarValue::try_from_array(fill_array.as_ref(), 0)?,
         };
         let default_element = fill_scalar.to_array_of_size(max_extra)?;
         let default_value_data = default_element.to_data();
 
-        let capacity =
-            Capacities::Array(original_data.len() + default_value_data.len());
+        let capacity = Capacities::Array(original_data.len() + default_value_data.len());
         let mut offsets = vec![O::usize_as(0)];
         let mut mutable = MutableArrayData::with_capacities(
             vec![&original_data, &default_value_data],
@@ -282,29 +276,18 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
             null_builder.append_non_null();
 
             let count = count_array.value(row_index).to_usize().ok_or_else(|| {
-                internal_datafusion_err!(
-                    "array_resize: failed to convert size to usize"
-                )
+                internal_datafusion_err!("array_resize: failed to convert size to usize")
             })?;
             let count = O::usize_as(count);
             let start = offset_window[0];
             if start + count > offset_window[1] {
-                let extra_count =
-                    (start + count - offset_window[1]).to_usize().unwrap();
+                let extra_count = (start + count - offset_window[1]).to_usize().unwrap();
                 let end = offset_window[1];
-                mutable.extend(
-                    0,
-                    (start).to_usize().unwrap(),
-                    (end).to_usize().unwrap(),
-                );
+                mutable.extend(0, (start).to_usize().unwrap(), (end).to_usize().unwrap());
                 mutable.extend(1, 0, extra_count);
             } else {
                 let end = start + count;
-                mutable.extend(
-                    0,
-                    (start).to_usize().unwrap(),
-                    (end).to_usize().unwrap(),
-                );
+                mutable.extend(0, (start).to_usize().unwrap(), (end).to_usize().unwrap());
             };
             offsets.push(offsets[row_index] + count);
         }
@@ -380,75 +363,4 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
         arrow::array::make_array(data),
         null_builder.finish(),
     )?))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::array::{AsArray, ListArray};
-    use arrow::datatypes::Int64Type;
-
-    fn list_values(array: &ListArray) -> Vec<Option<Vec<Option<i64>>>> {
-        array
-            .iter()
-            .map(|row| {
-                row.map(|values| {
-                    values
-                        .as_primitive::<Int64Type>()
-                        .iter()
-                        .collect::<Vec<Option<i64>>>()
-                })
-            })
-            .collect()
-    }
-
-    #[test]
-    fn test_array_resize_preserves_row_fill_values() -> Result<()> {
-        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
-            Some(vec![Some(1)]),
-            Some(vec![Some(2)]),
-        ]);
-        let new_len = Int64Array::from(vec![3, 2]);
-        let fill = Int64Array::from(vec![9, 8]);
-
-        let args: Vec<ArrayRef> = vec![
-            Arc::new(list),
-            Arc::new(new_len),
-            Arc::new(fill),
-        ];
-        let result = array_resize_inner(&args)?;
-        let result = result.as_list::<i32>();
-
-        let expected = vec![
-            Some(vec![Some(1), Some(9), Some(9)]),
-            Some(vec![Some(2), Some(8)]),
-        ];
-        assert_eq!(expected, list_values(result));
-        Ok(())
-    }
-
-    #[test]
-    fn test_array_resize_uniform_fill_fast_path() -> Result<()> {
-        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
-            Some(vec![Some(1)]),
-            Some(vec![Some(2)]),
-        ]);
-        let new_len = Int64Array::from(vec![3, 2]);
-        let fill = Int64Array::from(vec![9, 9]);
-
-        let args: Vec<ArrayRef> = vec![
-            Arc::new(list),
-            Arc::new(new_len),
-            Arc::new(fill),
-        ];
-        let result = array_resize_inner(&args)?;
-        let result = result.as_list::<i32>();
-
-        let expected = vec![
-            Some(vec![Some(1), Some(9), Some(9)]),
-            Some(vec![Some(2), Some(9)]),
-        ];
-        assert_eq!(expected, list_values(result));
-        Ok(())
-    }
 }

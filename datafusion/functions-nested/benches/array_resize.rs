@@ -19,8 +19,7 @@ use arrow::array::{ArrayRef, Int64Array, ListArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field};
 use criterion::{
-    criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup,
-    Criterion,
+    BenchmarkGroup, Criterion, criterion_group, criterion_main, measurement::WallTime,
 };
 use datafusion_common::config::ConfigOptions;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
@@ -32,16 +31,14 @@ const NUM_ROWS: usize = 1_000;
 
 fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("array_resize_i64");
-    let list_field: Arc<Field> =
-        Field::new_list_field(DataType::Int64, true).into();
+    let list_field: Arc<Field> = Field::new_list_field(DataType::Int64, true).into();
     let list_data_type = DataType::List(Arc::clone(&list_field));
     let arg_fields = vec![
         Field::new("array", list_data_type.clone(), true).into(),
         Field::new("size", DataType::Int64, false).into(),
         Field::new("value", DataType::Int64, true).into(),
     ];
-    let return_field: Arc<Field> =
-        Field::new("result", list_data_type, true).into();
+    let return_field: Arc<Field> = Field::new("result", list_data_type, true).into();
     let config_options = Arc::new(ConfigOptions::default());
     let two_arg_fields = arg_fields[..2].to_vec();
 
@@ -164,9 +161,9 @@ fn distinct_fill_array() -> ArrayRef {
 }
 
 fn mixed_size_array() -> ArrayRef {
-    Arc::new(Int64Array::from_iter((0..NUM_ROWS).map(|i| {
-        Some(if i % 2 == 0 { 200_i64 } else { 10_i64 })
-    })))
+    Arc::new(Int64Array::from_iter(
+        (0..NUM_ROWS).map(|i| Some(if i % 2 == 0 { 200_i64 } else { 10_i64 })),
+    ))
 }
 
 criterion_group!(benches, criterion_benchmark);
