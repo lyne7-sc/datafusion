@@ -45,64 +45,64 @@ fn criterion_benchmark(c: &mut Criterion) {
     bench_case(
         &mut group,
         "grow_uniform_fill_10_to_500",
-        vec![
+        &[
             ColumnarValue::Array(create_int64_list_array(NUM_ROWS, 10)),
             ColumnarValue::Array(repeated_int64_array(500)),
             ColumnarValue::Array(repeated_int64_array(7)),
         ],
-        arg_fields.clone(),
-        return_field.clone(),
-        config_options.clone(),
+        &arg_fields,
+        &return_field,
+        &config_options,
     );
 
     bench_case(
         &mut group,
         "shrink_uniform_fill_500_to_10",
-        vec![
+        &[
             ColumnarValue::Array(create_int64_list_array(NUM_ROWS, 500)),
             ColumnarValue::Array(repeated_int64_array(10)),
             ColumnarValue::Array(repeated_int64_array(7)),
         ],
-        arg_fields.clone(),
-        return_field.clone(),
-        config_options.clone(),
+        &arg_fields,
+        &return_field,
+        &config_options,
     );
 
     bench_case(
         &mut group,
         "grow_default_null_fill_10_to_500",
-        vec![
+        &[
             ColumnarValue::Array(create_int64_list_array(NUM_ROWS, 10)),
             ColumnarValue::Array(repeated_int64_array(500)),
         ],
-        two_arg_fields,
-        return_field.clone(),
-        config_options.clone(),
+        &two_arg_fields,
+        &return_field,
+        &config_options,
     );
 
     bench_case(
         &mut group,
         "grow_variable_fill_10_to_500",
-        vec![
+        &[
             ColumnarValue::Array(create_int64_list_array(NUM_ROWS, 10)),
             ColumnarValue::Array(repeated_int64_array(500)),
             ColumnarValue::Array(distinct_fill_array()),
         ],
-        arg_fields.clone(),
-        return_field.clone(),
-        config_options.clone(),
+        &arg_fields,
+        &return_field,
+        &config_options,
     );
 
     bench_case(
         &mut group,
         "mixed_grow_shrink_1000x_100",
-        vec![
+        &[
             ColumnarValue::Array(create_int64_list_array(NUM_ROWS, 100)),
             ColumnarValue::Array(mixed_size_array()),
         ],
-        arg_fields[..2].to_vec(),
-        return_field,
-        config_options,
+        &arg_fields[..2],
+        &return_field,
+        &config_options,
     );
 
     group.finish();
@@ -111,18 +111,18 @@ fn criterion_benchmark(c: &mut Criterion) {
 fn bench_case(
     group: &mut BenchmarkGroup<'_, WallTime>,
     name: &str,
-    args: Vec<ColumnarValue>,
-    arg_fields: Vec<Arc<Field>>,
-    return_field: Arc<Field>,
-    config_options: Arc<ConfigOptions>,
+    args: &[ColumnarValue],
+    arg_fields: &[Arc<Field>],
+    return_field: &Arc<Field>,
+    config_options: &Arc<ConfigOptions>,
 ) {
     let udf = ArrayResize::new();
     group.bench_function(name, |b| {
         b.iter(|| {
             black_box(
                 udf.invoke_with_args(ScalarFunctionArgs {
-                    args: args.clone(),
-                    arg_fields: arg_fields.clone(),
+                    args: args.to_vec(),
+                    arg_fields: arg_fields.to_vec(),
                     number_rows: NUM_ROWS,
                     return_field: return_field.clone(),
                     config_options: config_options.clone(),
