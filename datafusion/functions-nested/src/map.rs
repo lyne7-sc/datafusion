@@ -17,11 +17,18 @@
 
 use std::any::Any;
 use std::collections::VecDeque;
+use std::hash::Hash;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayData, ArrayRef, MapArray, OffsetSizeTrait, StructArray};
+use arrow::array::{
+    Array, ArrayData, ArrayRef, ArrowPrimitiveType, MapArray, OffsetSizeTrait,
+    StructArray, cast::AsArray,
+};
 use arrow::buffer::Buffer;
-use arrow::datatypes::{DataType, Field, SchemaBuilder, ToByteSlice};
+use arrow::datatypes::{
+    DataType, Date32Type, Date64Type, Field, Int8Type, Int16Type, Int32Type, Int64Type,
+    SchemaBuilder, ToByteSlice, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
 
 use datafusion_common::utils::{fixed_size_list_to_arrays, list_to_arrays};
 use datafusion_common::{
@@ -92,8 +99,36 @@ fn make_map_batch(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     make_map_batch_internal(&keys, &values, can_evaluate_to_const, &keys_arg.data_type())
 }
 
+/// Fast path for fixed-width primitive keys that avoids ScalarValue conversion.
+fn validate_unique_primitive_keys<T: ArrowPrimitiveType>(array: &dyn Array) -> Result<()>
+where
+    T::Native: Copy + Eq + Hash + std::fmt::Display,
+{
+    let primitive_array = array.as_primitive::<T>();
+    let mut seen_keys = HashSet::with_capacity(primitive_array.len());
+    for value in primitive_array.values().iter().copied() {
+        if !seen_keys.insert(value) {
+            return exec_err!("map key must be unique, duplicate key found: {}", value);
+        }
+    }
+    Ok(())
+}
+
+/// Fast path for string keys that hashes borrowed string slices directly.
+fn validate_unique_string_keys<O: OffsetSizeTrait>(array: &dyn Array) -> Result<()> {
+    let string_array = array.as_string::<O>();
+    let mut seen_keys = HashSet::with_capacity(string_array.len());
+    for i in 0..string_array.len() {
+        let value = string_array.value(i);
+        if !seen_keys.insert(value) {
+            return exec_err!("map key must be unique, duplicate key found: {}", value);
+        }
+    }
+    Ok(())
+}
+
 /// Validates that map keys are non-null and unique.
-fn validate_map_keys(array: &dyn Array) -> Result<()> {
+fn validate_unique_keys_generic(array: &dyn Array) -> Result<()> {
     let mut seen_keys = HashSet::with_capacity(array.len());
 
     for i in 0..array.len() {
@@ -105,12 +140,35 @@ fn validate_map_keys(array: &dyn Array) -> Result<()> {
         }
 
         // Validation 2: Map keys must be unique
-        if seen_keys.contains(&key) {
+        if !seen_keys.insert(key.clone()) {
             return exec_err!("map key must be unique, duplicate key found: {}", key);
         }
-        seen_keys.insert(key);
     }
     Ok(())
+}
+
+/// Validates that map keys are non-null and unique.
+fn validate_map_keys(array: &dyn Array) -> Result<()> {
+    if array.null_count() > 0 || (array.len() > 0 && array.data_type() == &DataType::Null)
+    {
+        return exec_err!("map key cannot be null");
+    }
+
+    match array.data_type() {
+        DataType::Int8 => validate_unique_primitive_keys::<Int8Type>(array),
+        DataType::Int16 => validate_unique_primitive_keys::<Int16Type>(array),
+        DataType::Int32 => validate_unique_primitive_keys::<Int32Type>(array),
+        DataType::Int64 => validate_unique_primitive_keys::<Int64Type>(array),
+        DataType::UInt8 => validate_unique_primitive_keys::<UInt8Type>(array),
+        DataType::UInt16 => validate_unique_primitive_keys::<UInt16Type>(array),
+        DataType::UInt32 => validate_unique_primitive_keys::<UInt32Type>(array),
+        DataType::UInt64 => validate_unique_primitive_keys::<UInt64Type>(array),
+        DataType::Date32 => validate_unique_primitive_keys::<Date32Type>(array),
+        DataType::Date64 => validate_unique_primitive_keys::<Date64Type>(array),
+        DataType::Utf8 => validate_unique_string_keys::<i32>(array),
+        DataType::LargeUtf8 => validate_unique_string_keys::<i64>(array),
+        _ => validate_unique_keys_generic(array),
+    }
 }
 
 fn get_first_array_ref(columnar_value: &ColumnarValue) -> Result<ArrayRef> {

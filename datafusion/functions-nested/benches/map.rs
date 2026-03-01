@@ -75,7 +75,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("map_1000", |b| {
+    c.bench_function("map_scalar_1000", |b| {
         let mut rng = rand::rng();
         let field = Arc::new(Field::new_list_field(DataType::Utf8, true));
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 1000]));
@@ -113,6 +113,70 @@ fn criterion_benchmark(c: &mut Criterion) {
                         args: vec![keys.clone(), values.clone()],
                         arg_fields: arg_fields.clone(),
                         number_rows: 1,
+                        return_field: Arc::clone(&return_field),
+                        config_options: Arc::clone(&config_options),
+                    })
+                    .expect("map should work on valid values"),
+            );
+        });
+    });
+
+    c.bench_function("map_array_1000x1000", |b| {
+        let mut rng = rand::rng();
+        let base_keys = keys(&mut rng);
+        let base_values = values(&mut rng);
+        let mut key_offsets = Vec::with_capacity(1001);
+        let mut value_offsets = Vec::with_capacity(1001);
+        let mut all_keys = Vec::with_capacity(1_000_000);
+        let mut all_values = Vec::with_capacity(1_000_000);
+
+        key_offsets.push(0);
+        value_offsets.push(0);
+        for row in 0..1000 {
+            for i in 0..1000 {
+                all_keys.push(format!("{row}_{}", base_keys[i]));
+                all_values.push(base_values[i] + (row * 10_000));
+            }
+            key_offsets.push((row + 1) * 1000);
+            value_offsets.push((row + 1) * 1000);
+        }
+
+        let field = Arc::new(Field::new_list_field(DataType::Utf8, true));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(key_offsets));
+        let key_list = Arc::new(ListArray::new(
+            field,
+            offsets,
+            Arc::new(StringArray::from(all_keys)),
+            None,
+        ));
+        let field = Arc::new(Field::new_list_field(DataType::Int32, true));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(value_offsets));
+        let value_list = Arc::new(ListArray::new(
+            field,
+            offsets,
+            Arc::new(Int32Array::from(all_values)),
+            None,
+        ));
+        let keys = ColumnarValue::Array(key_list);
+        let values = ColumnarValue::Array(value_list);
+
+        let return_type = map_udf()
+            .return_type(&[keys.data_type(), values.data_type()])
+            .expect("should get return type");
+        let arg_fields = vec![
+            Field::new("a", keys.data_type(), true).into(),
+            Field::new("a", values.data_type(), true).into(),
+        ];
+        let return_field = Field::new("f", return_type, true).into();
+        let config_options = Arc::new(ConfigOptions::default());
+
+        b.iter(|| {
+            black_box(
+                map_udf()
+                    .invoke_with_args(ScalarFunctionArgs {
+                        args: vec![keys.clone(), values.clone()],
+                        arg_fields: arg_fields.clone(),
+                        number_rows: 1000,
                         return_field: Arc::clone(&return_field),
                         config_options: Arc::clone(&config_options),
                     })
