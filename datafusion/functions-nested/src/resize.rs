@@ -209,6 +209,7 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
     // Track the largest per-row growth so the uniform-fill fast path can
     // materialize one reusable fill buffer of the required size.
     let mut max_extra: usize = 0;
+    let mut output_values_len: usize = 0;
     for (row_index, offset_window) in array.offsets().windows(2).enumerate() {
         if array.is_null(row_index) {
             continue;
@@ -216,18 +217,19 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
         let target_count = count_array.value(row_index).to_usize().ok_or_else(|| {
             internal_datafusion_err!("array_resize: failed to convert size to usize")
         })?;
+        output_values_len =
+            output_values_len.checked_add(target_count).ok_or_else(|| {
+                internal_datafusion_err!("array_resize: output size overflow")
+            })?;
         let current_len = (offset_window[1] - offset_window[0]).to_usize().unwrap();
         if target_count > current_len {
-            let extra = target_count - current_len;
-            if extra > max_extra {
-                max_extra = extra;
-            }
+            max_extra = max_extra.max(target_count - current_len);
         }
     }
 
     // The fast path is valid when at least one row grows and every row would
     // use the same fill value.
-    let is_uniform_fill = max_extra > 0
+    let use_bulk_fill = max_extra > 0
         && match &default_element {
             None => true,
             Some(fill_array) => {
@@ -246,7 +248,7 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
 
     // Fast path: at least one row needs to grow and all rows share
     // the same fill value.
-    if is_uniform_fill {
+    if use_bulk_fill {
         let fill_scalar = match &default_element {
             None => ScalarValue::try_from(&data_type)?,
             Some(fill_array) if fill_array.logical_null_count() == fill_array.len() => {
@@ -257,7 +259,7 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
         let default_element = fill_scalar.to_array_of_size(max_extra)?;
         let default_value_data = default_element.to_data();
 
-        let capacity = Capacities::Array(original_data.len() + default_value_data.len());
+        let capacity = Capacities::Array(output_values_len);
         let mut offsets = vec![O::usize_as(0)];
         let mut mutable = MutableArrayData::with_capacities(
             vec![&original_data, &default_value_data],
@@ -283,11 +285,11 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
             if start + count > offset_window[1] {
                 let extra_count = (start + count - offset_window[1]).to_usize().unwrap();
                 let end = offset_window[1];
-                mutable.extend(0, (start).to_usize().unwrap(), (end).to_usize().unwrap());
+                mutable.extend(0, start.to_usize().unwrap(), end.to_usize().unwrap());
                 mutable.extend(1, 0, extra_count);
             } else {
                 let end = start + count;
-                mutable.extend(0, (start).to_usize().unwrap(), (end).to_usize().unwrap());
+                mutable.extend(0, start.to_usize().unwrap(), end.to_usize().unwrap());
             };
             offsets.push(offsets[row_index] + count);
         }
@@ -312,7 +314,7 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
     let default_value_data = default_element.to_data();
 
     // create a mutable array to store the original data
-    let capacity = Capacities::Array(original_data.len() + default_value_data.len());
+    let capacity = Capacities::Array(output_values_len);
     let mut offsets = vec![O::usize_as(0)];
     let mut mutable = MutableArrayData::with_capacities(
         vec![&original_data, &default_value_data],
