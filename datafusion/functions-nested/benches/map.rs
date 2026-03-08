@@ -51,6 +51,16 @@ where
     values.into_iter().collect()
 }
 
+fn gen_repeat_values<T: Clone>(values: &[T], repeats: usize) -> Vec<T> {
+    let mut repeated = Vec::with_capacity(values.len() * repeats);
+
+    for _ in 0..repeats {
+        repeated.extend_from_slice(values);
+    }
+
+    repeated
+}
+
 fn gen_utf8_values(rng: &mut ThreadRng) -> Vec<String> {
     gen_unique_values(rng, |value| value.to_string())
 }
@@ -59,23 +69,14 @@ fn gen_binary_values(rng: &mut ThreadRng) -> Vec<Vec<u8>> {
     gen_unique_values(rng, |value| value.to_le_bytes().to_vec())
 }
 
-fn gen_int32_values(rng: &mut ThreadRng) -> Vec<i32> {
+fn gen_primitive_values(rng: &mut ThreadRng) -> Vec<i32> {
     gen_unique_values(rng, |value| value)
 }
 
-fn repeated_list_array<T: Clone>(
-    row_values: &[T],
-    row_count: usize,
-    make_values_array: impl FnOnce(Vec<T>) -> ArrayRef,
-) -> ArrayRef {
-    let values = (0..row_count)
-        .flat_map(|_| row_values.iter().cloned())
-        .collect::<Vec<_>>();
-    let values = make_values_array(values);
+fn list_array(values: ArrayRef, row_count: usize, values_per_row: usize) -> ArrayRef {
     let offsets = (0..=row_count)
-        .map(|index| (index * row_values.len()) as i32)
+        .map(|index| (index * values_per_row) as i32)
         .collect::<Vec<_>>();
-
     Arc::new(ListArray::new(
         Arc::new(Field::new_list_field(values.data_type().clone(), true)),
         OffsetBuffer::new(ScalarBuffer::from(offsets)),
@@ -120,18 +121,16 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("make_map_1000", |b| {
         let mut rng = rand::rng();
         let keys = gen_utf8_values(&mut rng);
-        let values = gen_int32_values(&mut rng);
+        let values = gen_primitive_values(&mut rng);
         let mut buffer = Vec::new();
-        for i in 0..MAP_KEYS_PER_ROW {
+        for i in 0..1000 {
             buffer.push(Expr::Literal(
                 ScalarValue::Utf8(Some(keys[i].clone())),
                 None,
             ));
             buffer.push(Expr::Literal(ScalarValue::Int32(Some(values[i])), None));
         }
-
         let planner = NestedFunctionPlanner {};
-
         b.iter(|| {
             black_box(
                 planner
@@ -142,30 +141,44 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 
     let mut rng = rand::rng();
-    let values = repeated_list_array(&gen_int32_values(&mut rng), MAP_ROWS, |values| {
-        Arc::new(Int32Array::from(values)) as ArrayRef
-    });
-    let utf8_keys = gen_utf8_values(&mut rng);
-    let binary_keys = gen_binary_values(&mut rng);
-    let int32_keys = gen_int32_values(&mut rng);
+    let values = Arc::new(Int32Array::from(gen_repeat_values(
+        &gen_primitive_values(&mut rng),
+        MAP_ROWS,
+    ))) as ArrayRef;
+    let values = list_array(values, MAP_ROWS, MAP_KEYS_PER_ROW);
     let map_cases = [
         (
             "map_1000_utf8",
-            repeated_list_array(&utf8_keys, MAP_ROWS, |values| {
-                Arc::new(StringArray::from(values)) as ArrayRef
-            }),
+            list_array(
+                Arc::new(StringArray::from(gen_repeat_values(
+                    &gen_utf8_values(&mut rng),
+                    MAP_ROWS,
+                ))) as ArrayRef,
+                MAP_ROWS,
+                MAP_KEYS_PER_ROW,
+            ),
         ),
         (
             "map_1000_binary",
-            repeated_list_array(&binary_keys, MAP_ROWS, |values| {
-                Arc::new(BinaryArray::from_iter_values(values)) as ArrayRef
-            }),
+            list_array(
+                Arc::new(BinaryArray::from_iter_values(gen_repeat_values(
+                    &gen_binary_values(&mut rng),
+                    MAP_ROWS,
+                ))) as ArrayRef,
+                MAP_ROWS,
+                MAP_KEYS_PER_ROW,
+            ),
         ),
         (
             "map_1000_int32",
-            repeated_list_array(&int32_keys, MAP_ROWS, |values| {
-                Arc::new(Int32Array::from(values)) as ArrayRef
-            }),
+            list_array(
+                Arc::new(Int32Array::from(gen_repeat_values(
+                    &gen_primitive_values(&mut rng),
+                    MAP_ROWS,
+                ))) as ArrayRef,
+                MAP_ROWS,
+                MAP_KEYS_PER_ROW,
+            ),
         ),
     ];
 
