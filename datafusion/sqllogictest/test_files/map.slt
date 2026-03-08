@@ -272,22 +272,6 @@ query error DataFusion error: Execution error: map key must be unique, duplicate
 SELECT MAP(make_array(X'647570', X'647570'), make_array(1, 2));
 
 statement ok
-create table null_map_rows as values
-  (make_array('a'), make_array(1)),
-  (arrow_cast(null, 'List(Utf8)'), make_array(2)),
-  (make_array('b'), make_array(3));
-
-query ?
-SELECT MAP(column1, column2) FROM null_map_rows;
-----
-{a: 1}
-NULL
-{b: 3}
-
-statement ok
-drop table null_map_rows;
-
-statement ok
 create table t as values
 ('a', 1, 'k1', 10, ['k1', 'k2'], [1, 2], 'POST', [[1,2,3]], ['a']),
 ('b', 2, 'k3', 30, ['k3'], [3], 'PUT', [[4]], ['b']),

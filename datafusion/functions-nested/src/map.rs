@@ -473,7 +473,7 @@ fn make_map_array_internal<O: OffsetSizeTrait>(
     let nulls_bitmap = keys.nulls().cloned();
 
     let keys = list_to_arrays::<O>(keys);
-    let values = list_to_arrays_skipping_null_rows::<O>(values, nulls_bitmap.as_ref());
+    let values = list_to_arrays::<O>(values);
 
     build_map_array(
         &keys,
@@ -500,8 +500,7 @@ fn make_map_array_from_fixed_size_list(
     let nulls_bitmap = keys.nulls().cloned();
 
     let keys = fixed_size_list_to_arrays(keys);
-    let values =
-        fixed_size_list_to_arrays_skipping_null_rows(values, nulls_bitmap.as_ref());
+    let values = fixed_size_list_to_arrays(values);
 
     build_map_array(
         &keys,
@@ -511,42 +510,6 @@ fn make_map_array_from_fixed_size_list(
         original_len,
         nulls_bitmap,
     )
-}
-
-fn list_to_arrays_skipping_null_rows<O: OffsetSizeTrait>(
-    array: &ArrayRef,
-    null_rows: Option<&arrow::buffer::NullBuffer>,
-) -> Vec<ArrayRef> {
-    array
-        .as_list::<O>()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, row)| {
-            if null_rows.is_some_and(|nulls| nulls.is_null(i)) {
-                None
-            } else {
-                row
-            }
-        })
-        .collect()
-}
-
-fn fixed_size_list_to_arrays_skipping_null_rows(
-    array: &ArrayRef,
-    null_rows: Option<&arrow::buffer::NullBuffer>,
-) -> Vec<ArrayRef> {
-    array
-        .as_fixed_size_list()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, row)| {
-            if null_rows.is_some_and(|nulls| nulls.is_null(i)) {
-                None
-            } else {
-                row
-            }
-        })
-        .collect()
 }
 
 /// Common logic to build a MapArray from decomposed list arrays
