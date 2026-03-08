@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{Int32Array, ListArray, StringArray};
+use arrow::array::{ArrayRef, BinaryArray, Int32Array, ListArray, StringArray};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::Field;
 use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use datafusion_common::config::ConfigOptions;
@@ -28,32 +28,100 @@ use datafusion_functions_nested::planner::NestedFunctionPlanner;
 use rand::Rng;
 use rand::prelude::ThreadRng;
 use std::collections::HashSet;
+use std::hash::Hash;
 use std::hint::black_box;
 use std::sync::Arc;
 
-fn keys(rng: &mut ThreadRng) -> Vec<String> {
-    let mut keys = HashSet::with_capacity(1000);
+const MAP_ROWS: usize = 1000;
+const MAP_KEYS_PER_ROW: usize = 1000;
 
-    while keys.len() < 1000 {
-        keys.insert(rng.random_range(0..10000).to_string());
+fn unique_values<T>(rng: &mut ThreadRng, mut make_value: impl FnMut(i32) -> T) -> Vec<T>
+where
+    T: Eq + Hash,
+{
+    let mut values = HashSet::with_capacity(MAP_KEYS_PER_ROW);
+
+    while values.len() < MAP_KEYS_PER_ROW {
+        values.insert(make_value(rng.random_range(0..10000)));
     }
 
-    keys.into_iter().collect()
+    values.into_iter().collect()
+}
+
+fn repeat_values<T: Clone>(values: &[T], repeats: usize) -> Vec<T> {
+    let mut repeated = Vec::with_capacity(values.len() * repeats);
+
+    for _ in 0..repeats {
+        repeated.extend_from_slice(values);
+    }
+
+    repeated
+}
+
+fn utf8_keys(rng: &mut ThreadRng) -> Vec<String> {
+    unique_values(rng, |value| value.to_string())
+}
+
+fn binary_keys(rng: &mut ThreadRng) -> Vec<Vec<u8>> {
+    unique_values(rng, |value| value.to_le_bytes().to_vec())
+}
+
+fn primitive_keys(rng: &mut ThreadRng) -> Vec<i32> {
+    unique_values(rng, |value| value)
 }
 
 fn values(rng: &mut ThreadRng) -> Vec<i32> {
-    let mut values = HashSet::with_capacity(1000);
+    unique_values(rng, |value| value)
+}
 
-    while values.len() < 1000 {
-        values.insert(rng.random_range(0..10000));
-    }
-    values.into_iter().collect()
+fn list_array(values: ArrayRef, row_count: usize, values_per_row: usize) -> ArrayRef {
+    let offsets = (0..=row_count)
+        .map(|index| (index * values_per_row) as i32)
+        .collect::<Vec<_>>();
+    Arc::new(ListArray::new(
+        Arc::new(Field::new_list_field(values.data_type().clone(), true)),
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        values,
+        None,
+    ))
+}
+
+fn bench_map_case(c: &mut Criterion, name: &str, keys: ArrayRef, values: ArrayRef) {
+    let number_rows = keys.len();
+    let keys = ColumnarValue::Array(keys);
+    let values = ColumnarValue::Array(values);
+
+    let return_type = map_udf()
+        .return_type(&[keys.data_type(), values.data_type()])
+        .expect("should get return type");
+    let arg_fields = vec![
+        Field::new("a", keys.data_type(), true).into(),
+        Field::new("a", values.data_type(), true).into(),
+    ];
+    let return_field = Field::new("f", return_type, true).into();
+    let config_options = Arc::new(ConfigOptions::default());
+
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            black_box(
+                map_udf()
+                    .invoke_with_args(ScalarFunctionArgs {
+                        args: vec![keys.clone(), values.clone()],
+                        arg_fields: arg_fields.clone(),
+                        number_rows,
+                        return_field: Arc::clone(&return_field),
+                        config_options: Arc::clone(&config_options),
+                    })
+                    .expect("map should work on valid values"),
+            );
+        });
+    });
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("make_map_1000", |b| {
         let mut rng = rand::rng();
-        let keys = keys(&mut rng);
+        let keys = utf8_keys(&mut rng);
         let values = values(&mut rng);
         let mut buffer = Vec::new();
         for i in 0..1000 {
@@ -75,51 +143,49 @@ fn criterion_benchmark(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("map_1000", |b| {
-        let mut rng = rand::rng();
-        let field = Arc::new(Field::new_list_field(DataType::Utf8, true));
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 1000]));
-        let key_list = ListArray::new(
-            field,
-            offsets,
-            Arc::new(StringArray::from(keys(&mut rng))),
-            None,
-        );
-        let field = Arc::new(Field::new_list_field(DataType::Int32, true));
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 1000]));
-        let value_list = ListArray::new(
-            field,
-            offsets,
-            Arc::new(Int32Array::from(values(&mut rng))),
-            None,
-        );
-        let keys = ColumnarValue::Scalar(ScalarValue::List(Arc::new(key_list)));
-        let values = ColumnarValue::Scalar(ScalarValue::List(Arc::new(value_list)));
+    let mut rng = rand::rng();
+    let values = Arc::new(Int32Array::from(repeat_values(&values(&mut rng), MAP_ROWS)))
+        as ArrayRef;
+    let values = list_array(values, MAP_ROWS, MAP_KEYS_PER_ROW);
+    let map_cases = [
+        (
+            "map_1000_utf8",
+            list_array(
+                Arc::new(StringArray::from(repeat_values(
+                    &utf8_keys(&mut rng),
+                    MAP_ROWS,
+                ))) as ArrayRef,
+                MAP_ROWS,
+                MAP_KEYS_PER_ROW,
+            ),
+        ),
+        (
+            "map_1000_binary",
+            list_array(
+                Arc::new(BinaryArray::from_iter_values(repeat_values(
+                    &binary_keys(&mut rng),
+                    MAP_ROWS,
+                ))) as ArrayRef,
+                MAP_ROWS,
+                MAP_KEYS_PER_ROW,
+            ),
+        ),
+        (
+            "map_1000_int32",
+            list_array(
+                Arc::new(Int32Array::from(repeat_values(
+                    &primitive_keys(&mut rng),
+                    MAP_ROWS,
+                ))) as ArrayRef,
+                MAP_ROWS,
+                MAP_KEYS_PER_ROW,
+            ),
+        ),
+    ];
 
-        let return_type = map_udf()
-            .return_type(&[keys.data_type(), values.data_type()])
-            .expect("should get return type");
-        let arg_fields = vec![
-            Field::new("a", keys.data_type(), true).into(),
-            Field::new("a", values.data_type(), true).into(),
-        ];
-        let return_field = Field::new("f", return_type, true).into();
-        let config_options = Arc::new(ConfigOptions::default());
-
-        b.iter(|| {
-            black_box(
-                map_udf()
-                    .invoke_with_args(ScalarFunctionArgs {
-                        args: vec![keys.clone(), values.clone()],
-                        arg_fields: arg_fields.clone(),
-                        number_rows: 1,
-                        return_field: Arc::clone(&return_field),
-                        config_options: Arc::clone(&config_options),
-                    })
-                    .expect("map should work on valid values"),
-            );
-        });
-    });
+    for (name, keys) in map_cases {
+        bench_map_case(c, name, keys, Arc::clone(&values));
+    }
 }
 
 criterion_group!(benches, criterion_benchmark);

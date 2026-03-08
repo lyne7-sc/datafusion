@@ -17,11 +17,18 @@
 
 use std::any::Any;
 use std::collections::VecDeque;
+use std::hash::Hash;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayData, ArrayRef, MapArray, OffsetSizeTrait, StructArray};
+use arrow::array::{
+    Array, ArrayData, ArrayRef, ArrowPrimitiveType, MapArray, OffsetSizeTrait,
+    StructArray, cast::AsArray,
+};
 use arrow::buffer::Buffer;
-use arrow::datatypes::{DataType, Field, SchemaBuilder, ToByteSlice};
+use arrow::datatypes::{
+    DataType, Date32Type, Date64Type, Field, Int8Type, Int16Type, Int32Type, Int64Type,
+    SchemaBuilder, ToByteSlice, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
 
 use datafusion_common::utils::{fixed_size_list_to_arrays, list_to_arrays};
 use datafusion_common::{
@@ -65,23 +72,30 @@ fn make_map_batch(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     let key_array = keys.as_ref();
 
     match keys_arg {
-        ColumnarValue::Array(_) => {
-            let row_keys = match key_array.data_type() {
-                DataType::List(_) => list_to_arrays::<i32>(&keys),
-                DataType::LargeList(_) => list_to_arrays::<i64>(&keys),
-                DataType::FixedSizeList(_, _) => fixed_size_list_to_arrays(&keys),
-                data_type => {
-                    return exec_err!(
-                        "Expected list, large_list or fixed_size_list, got {:?}",
-                        data_type
-                    );
-                }
-            };
-
-            row_keys
+        ColumnarValue::Array(_) => match key_array.data_type() {
+            DataType::List(_) => keys
+                .as_list::<i32>()
                 .iter()
-                .try_for_each(|key| validate_map_keys(key.as_ref()))?;
-        }
+                .flatten()
+                .try_for_each(|row| validate_map_keys(row.as_ref()))?,
+            DataType::LargeList(_) => keys
+                .as_list::<i64>()
+                .iter()
+                .flatten()
+                .try_for_each(|row| validate_map_keys(row.as_ref()))?,
+            DataType::FixedSizeList(_, _) => {
+                keys.as_fixed_size_list()
+                    .iter()
+                    .flatten()
+                    .try_for_each(|row| validate_map_keys(row.as_ref()))?
+            }
+            data_type => {
+                return exec_err!(
+                    "Expected list, large_list or fixed_size_list, got {:?}",
+                    data_type
+                );
+            }
+        },
         ColumnarValue::Scalar(_) => {
             validate_map_keys(key_array)?;
         }
@@ -92,8 +106,64 @@ fn make_map_batch(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     make_map_batch_internal(&keys, &values, can_evaluate_to_const, &keys_arg.data_type())
 }
 
-/// Validates that map keys are non-null and unique.
-fn validate_map_keys(array: &dyn Array) -> Result<()> {
+fn validate_unique_primitive_keys<T: ArrowPrimitiveType>(array: &dyn Array) -> Result<()>
+where
+    T::Native: Copy + Eq + Hash + std::fmt::Display,
+{
+    let primitive_array = array.as_primitive::<T>();
+    if primitive_array.null_count() > 0 {
+        return exec_err!("map key cannot be null");
+    }
+
+    validate_unique_values(
+        primitive_array.len(),
+        primitive_array.values().iter().copied(),
+        |value| format!("map key must be unique, duplicate key found: {}", value),
+    )
+}
+
+fn validate_unique_string_keys<O: OffsetSizeTrait>(array: &dyn Array) -> Result<()> {
+    let string_array = array.as_string::<O>();
+    if string_array.null_count() > 0 {
+        return exec_err!("map key cannot be null");
+    }
+
+    validate_unique_values(string_array.len(), string_array.iter().flatten(), |value| {
+        format!("map key must be unique, duplicate key found: {}", value)
+    })
+}
+
+fn validate_unique_binary_keys<O: OffsetSizeTrait>(array: &dyn Array) -> Result<()> {
+    let binary_array = array.as_binary::<O>();
+    if binary_array.null_count() > 0 {
+        return exec_err!("map key cannot be null");
+    }
+
+    validate_unique_values(binary_array.len(), binary_array.iter().flatten(), |value| {
+        format!("map key must be unique, duplicate key found: {:?}", value)
+    })
+}
+
+fn validate_unique_values<T, I, F>(
+    len: usize,
+    values: I,
+    duplicate_message: F,
+) -> Result<()>
+where
+    T: Copy + Eq + Hash,
+    I: IntoIterator<Item = T>,
+    F: Fn(T) -> String,
+{
+    let mut seen_keys = HashSet::with_capacity(len);
+    for value in values {
+        if !seen_keys.insert(value) {
+            return exec_err!("{}", duplicate_message(value));
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_keys_generic(array: &dyn Array) -> Result<()> {
     let mut seen_keys = HashSet::with_capacity(array.len());
 
     for i in 0..array.len() {
@@ -111,6 +181,27 @@ fn validate_map_keys(array: &dyn Array) -> Result<()> {
         seen_keys.insert(key);
     }
     Ok(())
+}
+
+/// Validates that map keys are non-null and unique.
+fn validate_map_keys(array: &dyn Array) -> Result<()> {
+    match array.data_type() {
+        DataType::Int8 => validate_unique_primitive_keys::<Int8Type>(array),
+        DataType::Int16 => validate_unique_primitive_keys::<Int16Type>(array),
+        DataType::Int32 => validate_unique_primitive_keys::<Int32Type>(array),
+        DataType::Int64 => validate_unique_primitive_keys::<Int64Type>(array),
+        DataType::UInt8 => validate_unique_primitive_keys::<UInt8Type>(array),
+        DataType::UInt16 => validate_unique_primitive_keys::<UInt16Type>(array),
+        DataType::UInt32 => validate_unique_primitive_keys::<UInt32Type>(array),
+        DataType::UInt64 => validate_unique_primitive_keys::<UInt64Type>(array),
+        DataType::Date32 => validate_unique_primitive_keys::<Date32Type>(array),
+        DataType::Date64 => validate_unique_primitive_keys::<Date64Type>(array),
+        DataType::Utf8 => validate_unique_string_keys::<i32>(array),
+        DataType::LargeUtf8 => validate_unique_string_keys::<i64>(array),
+        DataType::Binary => validate_unique_binary_keys::<i32>(array),
+        DataType::LargeBinary => validate_unique_binary_keys::<i64>(array),
+        _ => validate_unique_keys_generic(array),
+    }
 }
 
 fn get_first_array_ref(columnar_value: &ColumnarValue) -> Result<ArrayRef> {
@@ -381,7 +472,7 @@ fn make_map_array_internal<O: OffsetSizeTrait>(
     let nulls_bitmap = keys.nulls().cloned();
 
     let keys = list_to_arrays::<O>(keys);
-    let values = list_to_arrays::<O>(values);
+    let values = list_to_arrays_skipping_null_rows::<O>(values, nulls_bitmap.as_ref());
 
     build_map_array(
         &keys,
@@ -408,7 +499,8 @@ fn make_map_array_from_fixed_size_list(
     let nulls_bitmap = keys.nulls().cloned();
 
     let keys = fixed_size_list_to_arrays(keys);
-    let values = fixed_size_list_to_arrays(values);
+    let values =
+        fixed_size_list_to_arrays_skipping_null_rows(values, nulls_bitmap.as_ref());
 
     build_map_array(
         &keys,
@@ -420,6 +512,42 @@ fn make_map_array_from_fixed_size_list(
     )
 }
 
+fn list_to_arrays_skipping_null_rows<O: OffsetSizeTrait>(
+    array: &ArrayRef,
+    null_rows: Option<&arrow::buffer::NullBuffer>,
+) -> Vec<ArrayRef> {
+    array
+        .as_list::<O>()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            if null_rows.is_some_and(|nulls| nulls.is_null(i)) {
+                None
+            } else {
+                row
+            }
+        })
+        .collect()
+}
+
+fn fixed_size_list_to_arrays_skipping_null_rows(
+    array: &ArrayRef,
+    null_rows: Option<&arrow::buffer::NullBuffer>,
+) -> Vec<ArrayRef> {
+    array
+        .as_fixed_size_list()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            if null_rows.is_some_and(|nulls| nulls.is_null(i)) {
+                None
+            } else {
+                row
+            }
+        })
+        .collect()
+}
+
 /// Common logic to build a MapArray from decomposed list arrays
 fn build_map_array(
     keys: &[ArrayRef],
@@ -429,6 +557,10 @@ fn build_map_array(
     original_len: usize,
     nulls_bitmap: Option<arrow::buffer::NullBuffer>,
 ) -> Result<ColumnarValue> {
+    if keys.len() != values.len() {
+        return exec_err!("map requires key and value lists to have the same length");
+    }
+
     let mut key_array_vec = vec![];
     let mut value_array_vec = vec![];
     for (k, v) in keys.iter().zip(values.iter()) {
