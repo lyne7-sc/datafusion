@@ -115,11 +115,14 @@ where
         return exec_err!("map key cannot be null");
     }
 
-    validate_unique_values(
+    if let Some(value) = find_duplicate_value(
         primitive_array.len(),
         primitive_array.values().iter().copied(),
-        |value| format!("map key must be unique, duplicate key found: {}", value),
-    )
+    ) {
+        return exec_err!("map key must be unique, duplicate key found: {}", value);
+    }
+
+    Ok(())
 }
 
 fn validate_unique_string_keys<O: OffsetSizeTrait>(array: &dyn Array) -> Result<()> {
@@ -128,9 +131,13 @@ fn validate_unique_string_keys<O: OffsetSizeTrait>(array: &dyn Array) -> Result<
         return exec_err!("map key cannot be null");
     }
 
-    validate_unique_values(string_array.len(), string_array.iter().flatten(), |value| {
-        format!("map key must be unique, duplicate key found: {}", value)
-    })
+    if let Some(value) =
+        find_duplicate_value(string_array.len(), string_array.iter().flatten())
+    {
+        return exec_err!("map key must be unique, duplicate key found: {}", value);
+    }
+
+    Ok(())
 }
 
 fn validate_unique_binary_keys<O: OffsetSizeTrait>(array: &dyn Array) -> Result<()> {
@@ -139,28 +146,22 @@ fn validate_unique_binary_keys<O: OffsetSizeTrait>(array: &dyn Array) -> Result<
         return exec_err!("map key cannot be null");
     }
 
-    validate_unique_values(binary_array.len(), binary_array.iter().flatten(), |value| {
-        format!("map key must be unique, duplicate key found: {:?}", value)
-    })
+    if let Some(value) =
+        find_duplicate_value(binary_array.len(), binary_array.iter().flatten())
+    {
+        return exec_err!("map key must be unique, duplicate key found: {:?}", value);
+    }
+
+    Ok(())
 }
 
-fn validate_unique_values<T, I, F>(
-    len: usize,
-    values: I,
-    duplicate_message: F,
-) -> Result<()>
+fn find_duplicate_value<T, I>(len: usize, values: I) -> Option<T>
 where
     T: Copy + Eq + Hash,
     I: IntoIterator<Item = T>,
-    F: Fn(T) -> String,
 {
     let mut seen_keys = HashSet::with_capacity(len);
-    for value in values {
-        if !seen_keys.insert(value) {
-            return exec_err!("{}", duplicate_message(value));
-        }
-    }
-    Ok(())
+    values.into_iter().find(|value| !seen_keys.insert(*value))
 }
 
 fn validate_unique_keys_generic(array: &dyn Array) -> Result<()> {
