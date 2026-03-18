@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{ArrayRef, BinaryArray, Int32Array, ListArray, StringArray};
+use arrow::array::{
+    ArrayRef, BinaryArray, BinaryViewArray, Int32Array, ListArray, StringArray,
+    StringViewArray,
+};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::Field;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -162,6 +165,28 @@ fn criterion_benchmark(c: &mut Criterion) {
             "map_1000_binary",
             list_array(
                 Arc::new(BinaryArray::from_iter_values(gen_repeat_values(
+                    &gen_binary_values(&mut rng),
+                    MAP_ROWS,
+                ))) as ArrayRef,
+                MAP_ROWS,
+                MAP_KEYS_PER_ROW,
+            ),
+        ),
+        (
+            "map_1000_utf8_view",
+            list_array(
+                Arc::new(StringViewArray::from(gen_repeat_values(
+                    &gen_utf8_values(&mut rng),
+                    MAP_ROWS,
+                ))) as ArrayRef,
+                MAP_ROWS,
+                MAP_KEYS_PER_ROW,
+            ),
+        ),
+        (
+            "map_1000_binary_view",
+            list_array(
+                Arc::new(BinaryViewArray::from_iter_values(gen_repeat_values(
                     &gen_binary_values(&mut rng),
                     MAP_ROWS,
                 ))) as ArrayRef,

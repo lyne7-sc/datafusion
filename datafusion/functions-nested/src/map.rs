@@ -125,30 +125,32 @@ where
     Ok(())
 }
 
-fn validate_unique_string_keys<O: OffsetSizeTrait>(array: &dyn Array) -> Result<()> {
-    let string_array = array.as_string::<O>();
-    if string_array.null_count() > 0 {
+fn validate_unique_str_keys<'a>(
+    null_count: usize,
+    len: usize,
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    if null_count > 0 {
         return exec_err!("map key cannot be null");
     }
 
-    if let Some(value) =
-        find_duplicate_value(string_array.len(), string_array.iter().flatten())
-    {
+    if let Some(value) = find_duplicate_value(len, values) {
         return exec_err!("map key must be unique, duplicate key found: {}", value);
     }
 
     Ok(())
 }
 
-fn validate_unique_binary_keys<O: OffsetSizeTrait>(array: &dyn Array) -> Result<()> {
-    let binary_array = array.as_binary::<O>();
-    if binary_array.null_count() > 0 {
+fn validate_unique_binary_keys<'a>(
+    null_count: usize,
+    len: usize,
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<()> {
+    if null_count > 0 {
         return exec_err!("map key cannot be null");
     }
 
-    if let Some(value) =
-        find_duplicate_value(binary_array.len(), binary_array.iter().flatten())
-    {
+    if let Some(value) = find_duplicate_value(len, values) {
         return exec_err!("map key must be unique, duplicate key found: {:?}", value);
     }
 
@@ -197,10 +199,30 @@ fn validate_map_keys(array: &dyn Array) -> Result<()> {
         DataType::UInt64 => validate_unique_primitive_keys::<UInt64Type>(array),
         DataType::Date32 => validate_unique_primitive_keys::<Date32Type>(array),
         DataType::Date64 => validate_unique_primitive_keys::<Date64Type>(array),
-        DataType::Utf8 => validate_unique_string_keys::<i32>(array),
-        DataType::LargeUtf8 => validate_unique_string_keys::<i64>(array),
-        DataType::Binary => validate_unique_binary_keys::<i32>(array),
-        DataType::LargeBinary => validate_unique_binary_keys::<i64>(array),
+        DataType::Utf8 => {
+            let arr = array.as_string::<i32>();
+            validate_unique_str_keys(arr.null_count(), arr.len(), arr.iter().flatten())
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_string::<i64>();
+            validate_unique_str_keys(arr.null_count(), arr.len(), arr.iter().flatten())
+        }
+        DataType::Utf8View => {
+            let arr = array.as_string_view();
+            validate_unique_str_keys(arr.null_count(), arr.len(), arr.iter().flatten())
+        }
+        DataType::Binary => {
+            let arr = array.as_binary::<i32>();
+            validate_unique_binary_keys(arr.null_count(), arr.len(), arr.iter().flatten())
+        }
+        DataType::LargeBinary => {
+            let arr = array.as_binary::<i32>();
+            validate_unique_binary_keys(arr.null_count(), arr.len(), arr.iter().flatten())
+        }
+        DataType::BinaryView => {
+            let arr = array.as_binary_view();
+            validate_unique_binary_keys(arr.null_count(), arr.len(), arr.iter().flatten())
+        }
         _ => validate_unique_keys_generic(array),
     }
 }
