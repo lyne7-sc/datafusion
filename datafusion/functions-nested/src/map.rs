@@ -216,7 +216,7 @@ fn validate_map_keys(array: &dyn Array) -> Result<()> {
             validate_unique_binary_keys(arr.null_count(), arr.len(), arr.iter().flatten())
         }
         DataType::LargeBinary => {
-            let arr = array.as_binary::<i32>();
+            let arr = array.as_binary::<i64>();
             validate_unique_binary_keys(arr.null_count(), arr.len(), arr.iter().flatten())
         }
         DataType::BinaryView => {
