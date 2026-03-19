@@ -848,7 +848,7 @@ mod tests {
 
         use arrow::array::FixedSizeListBuilder;
 
-        // Build keys array as FixedSizeList(2): [['a', 'b'], ['c', 'd']]
+        // Build keys array as FixedSizeList(2): [['a', 'b'], NULL, ['c', 'd']]
         let key_values_builder = arrow::array::StringBuilder::new();
         let mut key_builder = FixedSizeListBuilder::new(key_values_builder, 2);
 
@@ -857,6 +857,11 @@ mod tests {
         key_builder.values().append_value("b");
         key_builder.append(true);
 
+        // Second map: NULL (entire map is NULL)
+        key_builder.values().append_null();
+        key_builder.values().append_null();
+        key_builder.append(false);
+
         // Second map: ['c', 'd']
         key_builder.values().append_value("c");
         key_builder.values().append_value("d");
@@ -864,12 +869,17 @@ mod tests {
 
         let keys_array = Arc::new(key_builder.finish());
 
-        // Build values array as FixedSizeList(2): [[1, 2], [3, 4]]
+        // Build values array as FixedSizeList(2): [[1, 2], [99, 100], [3, 4]]
+        // The middle row should be ignored because the corresponding key row is NULL.
         let value_values_builder = arrow::array::Int32Builder::new();
         let mut value_builder = FixedSizeListBuilder::new(value_values_builder, 2);
 
         value_builder.values().append_value(1);
         value_builder.values().append_value(2);
+        value_builder.append(true);
+
+        value_builder.values().append_value(99);
+        value_builder.values().append_value(100);
         value_builder.append(true);
 
         value_builder.values().append_value(3);
@@ -896,8 +906,9 @@ mod tests {
             _ => panic!("Expected Array result"),
         };
 
-        assert_eq!(map_array.len(), 2, "Should have 2 maps");
+        assert_eq!(map_array.len(), 3, "Should have 3 maps");
         assert!(!map_array.is_null(0), "First map should not be NULL");
-        assert!(!map_array.is_null(1), "Second map should not be NULL");
+        assert!(map_array.is_null(1), "Second map should be NULL");
+        assert!(!map_array.is_null(2), "Third map should not be NULL");
     }
 }
