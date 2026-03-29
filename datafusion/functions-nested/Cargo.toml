@@ -96,6 +96,10 @@ name = "map"
 
 [[bench]]
 harness = false
+name = "map_extract"
+
+[[bench]]
+harness = false
 name = "array_remove"
 
 [[bench]]

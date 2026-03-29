@@ -642,6 +642,22 @@ select map_extract(MAP {1: 1, 2: 2, 3:3}, '1'), map_extract(MAP {1: 1, 2: 2, 3:3
 ----
 [1] [1] [1] [NULL] [1]
 
+# binary and binary view keys
+query ????
+select map_extract(MAP {arrow_cast('a', 'Binary'): 1, arrow_cast('b', 'Binary'): 2}, arrow_cast('b', 'Binary')),
+       map_extract(MAP {arrow_cast('a', 'LargeBinary'): 1, arrow_cast('b', 'LargeBinary'): 2}, arrow_cast('c', 'LargeBinary')),
+       map_extract(MAP {arrow_cast('a', 'BinaryView'): 1, arrow_cast('b', 'BinaryView'): 2}, arrow_cast('b', 'BinaryView')),
+       map_extract(MAP {arrow_cast('a', 'BinaryView'): 1, arrow_cast('b', 'BinaryView'): 2}, arrow_cast(NULL, 'BinaryView'));
+----
+[2] [NULL] [2] [NULL]
+
+# nested datatype keys
+query ??
+select map_extract(MAP {[1, 2]: 10, [3, 4]: 20}, [3, 4]),
+       map_extract(MAP {[1, 2]: 10, [3, 4]: 20}, [5, 6]);
+----
+[20] [NULL]
+
 # map_extract with columns
 query ???
 select map_extract(column1, 1), map_extract(column1, 5), map_extract(column1, 7) from map_array_table_1;

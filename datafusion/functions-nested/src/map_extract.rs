@@ -19,10 +19,14 @@
 
 use crate::utils::{get_map_entry_field, make_scalar_function};
 use arrow::array::{
-    Array, ArrayRef, Capacities, ListArray, MapArray, MutableArrayData, make_array,
+    Array, ArrayAccessor, ArrayRef, Capacities, ListArray, MapArray, MutableArrayData,
+    cast::AsArray, make_array,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{
+    DataType, Date32Type, Date64Type, Field, Int8Type, Int16Type, Int32Type, Int64Type,
+    UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
 use datafusion_common::utils::take_function_args;
 use datafusion_common::{Result, cast::as_map_array, exec_err};
 use datafusion_expr::{
@@ -130,11 +134,41 @@ impl ScalarUDFImpl for MapExtract {
     }
 }
 
+/// Fast path for key types that support direct typed value comparison.
+///
+/// This avoids the generic single-element slice comparison used by
+/// `general_map_extract_inner`.
+fn specialized_map_extract_inner<A>(
+    map_array: &MapArray,
+    keys: A,
+    query_keys: A,
+) -> Result<ArrayRef>
+where
+    A: ArrayAccessor,
+    A::Item: PartialEq,
+{
+    map_extract_with_match(map_array, move |row_index, key_index| {
+        query_keys.is_valid(row_index)
+            && keys.is_valid(key_index)
+            && keys.value(key_index) == query_keys.value(row_index)
+    })
+}
+
 fn general_map_extract_inner(
     map_array: &MapArray,
     query_keys_array: &dyn Array,
 ) -> Result<ArrayRef> {
-    let keys = map_array.keys();
+    map_extract_with_match(map_array, |row_index, key_index| {
+        let query_key = query_keys_array.slice(row_index, 1);
+        query_keys_array.is_valid(row_index)
+            && map_array.keys().slice(key_index, 1).as_ref() == query_key.as_ref()
+    })
+}
+
+fn map_extract_with_match(
+    map_array: &MapArray,
+    mut key_matches: impl FnMut(usize, usize) -> bool,
+) -> Result<ArrayRef> {
     let mut offsets = vec![0_i32];
 
     let values = map_array.values();
@@ -147,16 +181,12 @@ fn general_map_extract_inner(
     for (row_index, offset_window) in map_array.value_offsets().windows(2).enumerate() {
         let start = offset_window[0] as usize;
         let end = offset_window[1] as usize;
-        let len = end - start;
-
-        let query_key = query_keys_array.slice(row_index, 1);
-
         let value_index =
-            (0..len).find(|&i| keys.slice(start + i, 1).as_ref() == query_key.as_ref());
+            (start..end).find(|&key_index| key_matches(row_index, key_index));
 
         match value_index {
             Some(index) => {
-                mutable.extend(0, start + index, start + index + 1);
+                mutable.extend(0, index, index + 1);
             }
             None => {
                 mutable.extend_nulls(1);
@@ -193,5 +223,87 @@ fn map_extract_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
         );
     }
 
-    general_map_extract_inner(map_array, key_arg)
+    match key_type {
+        DataType::Int8 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_primitive::<Int8Type>(),
+            key_arg.as_primitive::<Int8Type>(),
+        ),
+        DataType::Int16 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_primitive::<Int16Type>(),
+            key_arg.as_primitive::<Int16Type>(),
+        ),
+        DataType::Int32 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_primitive::<Int32Type>(),
+            key_arg.as_primitive::<Int32Type>(),
+        ),
+        DataType::Int64 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_primitive::<Int64Type>(),
+            key_arg.as_primitive::<Int64Type>(),
+        ),
+        DataType::UInt8 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_primitive::<UInt8Type>(),
+            key_arg.as_primitive::<UInt8Type>(),
+        ),
+        DataType::UInt16 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_primitive::<UInt16Type>(),
+            key_arg.as_primitive::<UInt16Type>(),
+        ),
+        DataType::UInt32 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_primitive::<UInt32Type>(),
+            key_arg.as_primitive::<UInt32Type>(),
+        ),
+        DataType::UInt64 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_primitive::<UInt64Type>(),
+            key_arg.as_primitive::<UInt64Type>(),
+        ),
+        DataType::Date32 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_primitive::<Date32Type>(),
+            key_arg.as_primitive::<Date32Type>(),
+        ),
+        DataType::Date64 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_primitive::<Date64Type>(),
+            key_arg.as_primitive::<Date64Type>(),
+        ),
+        DataType::Utf8 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_string::<i32>(),
+            key_arg.as_string::<i32>(),
+        ),
+        DataType::LargeUtf8 => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_string::<i64>(),
+            key_arg.as_string::<i64>(),
+        ),
+        DataType::Utf8View => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_string_view(),
+            key_arg.as_string_view(),
+        ),
+        DataType::Binary => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_binary::<i32>(),
+            key_arg.as_binary::<i32>(),
+        ),
+        DataType::LargeBinary => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_binary::<i64>(),
+            key_arg.as_binary::<i64>(),
+        ),
+        DataType::BinaryView => specialized_map_extract_inner(
+            map_array,
+            map_array.keys().as_binary_view(),
+            key_arg.as_binary_view(),
+        ),
+        _ => general_map_extract_inner(map_array, key_arg),
+    }
 }
