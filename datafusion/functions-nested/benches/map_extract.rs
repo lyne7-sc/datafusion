@@ -99,7 +99,7 @@ fn bench_map_extract_case(
     c: &mut Criterion,
     name: &str,
     map_array: ArrayRef,
-    key_arg: ColumnarValue,
+    key_arg: &ColumnarValue,
 ) {
     let number_rows = map_array.len();
     let map_arg = ColumnarValue::Array(map_array);
@@ -314,7 +314,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     add_cases!("binary_view", build_binary_view_case);
 
     for (name, map_array, key_arg) in map_extract_cases {
-        bench_map_extract_case(c, &name, map_array, key_arg);
+        bench_map_extract_case(c, &name, map_array, &key_arg);
     }
 }
 
