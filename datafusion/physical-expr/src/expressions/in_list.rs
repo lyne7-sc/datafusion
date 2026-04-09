@@ -177,12 +177,160 @@ fn instantiate_static_filter(
         // Float primitive types (use ordered wrappers for Hash/Eq)
         DataType::Float32 => Ok(Arc::new(Float32StaticFilter::try_new(&in_array)?)),
         DataType::Float64 => Ok(Arc::new(Float64StaticFilter::try_new(&in_array)?)),
+        DataType::Utf8 => Ok(Arc::new(Utf8StaticFilter::try_new(&in_array)?)),
+        DataType::LargeUtf8 => Ok(Arc::new(LargeUtf8StaticFilter::try_new(&in_array)?)),
+        DataType::Utf8View => Ok(Arc::new(Utf8ViewStaticFilter::try_new(&in_array)?)),
         _ => {
             /* fall through to generic implementation for unsupported types (Struct, etc.) */
             Ok(Arc::new(ArrayStaticFilter::try_new(in_array)?))
         }
     }
 }
+
+macro_rules! string_static_filter {
+    ($Name:ident, $ArrayType:ty, $TryDowncast:ident $(::<$offset:ty>)?) => {
+        struct $Name {
+            null_count: usize,
+            in_array: ArrayRef,
+            state: RandomState,
+            map: HashMap<usize, (), ()>,
+        }
+
+        impl $Name {
+            fn try_new(in_array: &ArrayRef) -> Result<Self> {
+                let array = Arc::clone(in_array);
+                let in_array = array.$TryDowncast$(::<$offset>)?().ok_or_else(|| {
+                    exec_datafusion_err!(
+                        "Failed to downcast an array to a '{}' array",
+                        stringify!($ArrayType)
+                    )
+                })?;
+
+                let null_count = in_array.null_count();
+                let state = RandomState::default();
+                let mut map: HashMap<usize, (), ()> =
+                    HashMap::with_capacity_and_hasher(in_array.len() - null_count, ());
+
+                with_hashes([&array], &state, |hashes| -> Result<()> {
+                    let insert_value = |idx: usize| {
+                        let hash = hashes[idx];
+                        if let RawEntryMut::Vacant(v) = map
+                            .raw_entry_mut()
+                            .from_hash(hash, |x| in_array.value(*x) == in_array.value(idx))
+                        {
+                            v.insert_with_hasher(hash, idx, (), |x| hashes[*x]);
+                        }
+                    };
+
+                    match in_array.nulls() {
+                        Some(nulls) => BitIndexIterator::new(
+                            nulls.validity(),
+                            nulls.offset(),
+                            nulls.len(),
+                        )
+                        .for_each(insert_value),
+                        None => (0..in_array.len()).for_each(insert_value),
+                    }
+
+                    Ok(())
+                })?;
+
+                Ok(Self {
+                    null_count,
+                    in_array: array,
+                    state,
+                    map,
+                })
+            }
+        }
+
+        impl StaticFilter for $Name {
+            fn null_count(&self) -> usize {
+                self.null_count
+            }
+
+            fn contains(&self, v: &dyn Array, negated: bool) -> Result<BooleanArray> {
+                downcast_dictionary_array! {
+                    v => {
+                        let values_contains = self.contains(v.values().as_ref(), negated)?;
+                        let result = take(&values_contains, v.keys(), None)?;
+                        return Ok(downcast_array(result.as_ref()))
+                    }
+                    _ => {}
+                }
+
+                let needle = v.$TryDowncast$(::<$offset>)?().ok_or_else(|| {
+                    exec_datafusion_err!(
+                        "Failed to downcast an array to a '{}' array",
+                        stringify!($ArrayType)
+                    )
+                })?;
+                let haystack = self
+                    .in_array
+                    .$TryDowncast$(::<$offset>)?()
+                    .ok_or_else(|| {
+                    exec_datafusion_err!(
+                        "Failed to downcast an array to a '{}' array",
+                        stringify!($ArrayType)
+                    )
+                })?;
+
+                let haystack_has_nulls = self.null_count > 0;
+                let needle_nulls = needle.nulls();
+                let needle_has_nulls = needle.null_count() > 0;
+
+                let contains_buffer =
+                    with_hashes([v as &dyn Array], &self.state, |hashes| {
+                        Ok(BooleanBuffer::collect_bool(needle.len(), |i| {
+                            let contains = self
+                                .map
+                                .raw_entry()
+                                .from_hash(hashes[i], |idx| {
+                                    needle.value(i) == haystack.value(*idx)
+                                })
+                                .is_some();
+                            contains ^ negated
+                        }))
+                    })?;
+
+                let result_nulls = match (needle_has_nulls, haystack_has_nulls) {
+                    (false, false) => None,
+                    (true, false) => needle_nulls.cloned(),
+                    (false, true) => {
+                        let validity = if negated {
+                            !&contains_buffer
+                        } else {
+                            contains_buffer.clone()
+                        };
+                        Some(NullBuffer::new(validity))
+                    }
+                    (true, true) => {
+                        let needle_validity = needle_nulls
+                            .map(|n| n.inner().clone())
+                            .unwrap_or_else(|| BooleanBuffer::new_set(v.len()));
+                        let haystack_validity = if negated {
+                            !&contains_buffer
+                        } else {
+                            contains_buffer.clone()
+                        };
+                        let combined_validity = &needle_validity & &haystack_validity;
+                        Some(NullBuffer::new(combined_validity))
+                    }
+                };
+
+                Ok(BooleanArray::new(contains_buffer, result_nulls))
+            }
+        }
+    };
+}
+
+string_static_filter!(Utf8StaticFilter, StringArray, as_string_opt::<i32>);
+string_static_filter!(
+    LargeUtf8StaticFilter,
+    LargeStringArray,
+    as_string_opt::<i64>
+);
+string_static_filter!(Utf8ViewStaticFilter, StringViewArray, as_string_view_opt);
 
 impl ArrayStaticFilter {
     /// Computes a [`StaticFilter`] for the provided [`Array`] if there
@@ -3962,24 +4110,40 @@ mod tests {
             );
         }
 
-        // Utf8 (falls through to ArrayStaticFilter)
+        let string_cases = vec![
+            (
+                "Utf8",
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "d", "b"])) as ArrayRef,
+            ),
+            (
+                "LargeUtf8",
+                Arc::new(LargeStringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["a", "d", "b"])) as ArrayRef,
+            ),
+            (
+                "Utf8View",
+                Arc::new(StringViewArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                Arc::new(StringViewArray::from(vec!["a", "d", "b"])) as ArrayRef,
+            ),
+        ];
+
+        for (name, in_array, needle) in string_cases {
+            assert_eq!(
+                expected,
+                eval_in_list_from_array(Arc::clone(&needle), Arc::clone(&in_array),)?,
+                "same-type failed for {name}"
+            );
+
+            assert_eq!(
+                expected,
+                eval_in_list_from_array(wrap_in_dict(needle), in_array)?,
+                "dict-needle failed for {name}"
+            );
+        }
+
         let utf8_in = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
         let utf8_needle = Arc::new(StringArray::from(vec!["a", "d", "b"])) as ArrayRef;
-
-        // Utf8 in_array, Utf8 needle
-        assert_eq!(
-            expected,
-            eval_in_list_from_array(Arc::clone(&utf8_needle), Arc::clone(&utf8_in),)?
-        );
-
-        // Utf8 in_array, Dict(Utf8) needle
-        assert_eq!(
-            expected,
-            eval_in_list_from_array(
-                wrap_in_dict(Arc::clone(&utf8_needle)),
-                Arc::clone(&utf8_in),
-            )?
-        );
 
         // Dict(Utf8) in_array, Dict(Utf8) needle: the #20937 bug
         assert_eq!(
@@ -4081,6 +4245,29 @@ mod tests {
             err.contains("Can't compare arrays of different types"),
             "{err}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_utf8_static_filter_avoids_string_copies() -> Result<()> {
+        let in_array = Arc::new(StringArray::from(vec![
+            Some("alpha"),
+            Some("beta"),
+            Some("alpha"),
+            None,
+        ])) as ArrayRef;
+
+        let filter = Utf8StaticFilter::try_new(&in_array)?;
+
+        assert_eq!(filter.null_count(), 1);
+        assert_eq!(filter.map.len(), 2);
+
+        let needle = Arc::new(StringArray::from(vec![Some("alpha"), Some("gamma"), None]))
+            as ArrayRef;
+
+        let result = filter.contains(needle.as_ref(), false)?;
+        assert_eq!(result, BooleanArray::from(vec![Some(true), None, None]));
 
         Ok(())
     }
