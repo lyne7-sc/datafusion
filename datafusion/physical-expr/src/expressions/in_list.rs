@@ -281,6 +281,7 @@ macro_rules! string_static_filter {
                 let needle_nulls = needle.nulls();
                 let needle_has_nulls = needle.null_count() > 0;
 
+                // Match the same SQL three-valued logic as the primitive/float specializations;
                 let contains_buffer =
                     with_hashes([v as &dyn Array], &self.state, |hashes| {
                         Ok(BooleanBuffer::collect_bool(needle.len(), |i| {
@@ -4112,7 +4113,7 @@ mod tests {
             );
         }
 
-        // Utf8 (falls through to ArrayStaticFilter)
+        // Utf8 (uses Utf8StaticFilter)
         let utf8_in = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
         let utf8_needle = Arc::new(StringArray::from(vec!["a", "d", "b"])) as ArrayRef;
 
