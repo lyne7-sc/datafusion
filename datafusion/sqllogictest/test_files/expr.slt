@@ -1068,6 +1068,86 @@ SELECT 'c' NOT IN ('a','b',NULL)
 NULL
 
 query B
+SELECT arrow_cast('a', 'Utf8View') IN (arrow_cast('a', 'Utf8View'), arrow_cast('b', 'Utf8View'))
+----
+true
+
+query B
+SELECT arrow_cast('c', 'Utf8View') IN (arrow_cast('a', 'Utf8View'), arrow_cast('b', 'Utf8View'))
+----
+false
+
+query B
+SELECT arrow_cast('a', 'Utf8View') NOT IN (arrow_cast('a', 'Utf8View'), arrow_cast('b', 'Utf8View'))
+----
+false
+
+query B
+SELECT arrow_cast('c', 'Utf8View') NOT IN (arrow_cast('a', 'Utf8View'), arrow_cast('b', 'Utf8View'))
+----
+true
+
+query B
+SELECT arrow_cast('a', 'Utf8View') IN (arrow_cast('a', 'Utf8View'), arrow_cast('b', 'Utf8View'), NULL)
+----
+true
+
+query B
+SELECT arrow_cast('c', 'Utf8View') IN (arrow_cast('a', 'Utf8View'), arrow_cast('b', 'Utf8View'), NULL)
+----
+NULL
+
+query B
+SELECT arrow_cast('a', 'Utf8View') NOT IN (arrow_cast('a', 'Utf8View'), arrow_cast('b', 'Utf8View'), NULL)
+----
+false
+
+query B
+SELECT arrow_cast('c', 'Utf8View') NOT IN (arrow_cast('a', 'Utf8View'), arrow_cast('b', 'Utf8View'), NULL)
+----
+NULL
+
+query B
+SELECT arrow_cast('a', 'LargeUtf8') IN (arrow_cast('a', 'LargeUtf8'), arrow_cast('b', 'LargeUtf8'))
+----
+true
+
+query B
+SELECT arrow_cast('c', 'LargeUtf8') IN (arrow_cast('a', 'LargeUtf8'), arrow_cast('b', 'LargeUtf8'))
+----
+false
+
+query B
+SELECT arrow_cast('a', 'LargeUtf8') NOT IN (arrow_cast('a', 'LargeUtf8'), arrow_cast('b', 'LargeUtf8'))
+----
+false
+
+query B
+SELECT arrow_cast('c', 'LargeUtf8') NOT IN (arrow_cast('a', 'LargeUtf8'), arrow_cast('b', 'LargeUtf8'))
+----
+true
+
+query B
+SELECT arrow_cast('a', 'LargeUtf8') IN (arrow_cast('a', 'LargeUtf8'), arrow_cast('b', 'LargeUtf8'), NULL)
+----
+true
+
+query B
+SELECT arrow_cast('c', 'LargeUtf8') IN (arrow_cast('a', 'LargeUtf8'), arrow_cast('b', 'LargeUtf8'), NULL)
+----
+NULL
+
+query B
+SELECT arrow_cast('a', 'LargeUtf8') NOT IN (arrow_cast('a', 'LargeUtf8'), arrow_cast('b', 'LargeUtf8'), NULL)
+----
+false
+
+query B
+SELECT arrow_cast('c', 'LargeUtf8') NOT IN (arrow_cast('a', 'LargeUtf8'), arrow_cast('b', 'LargeUtf8'), NULL)
+----
+NULL
+
+query B
 SELECT 0 IN (0,1,2)
 ----
 true
@@ -1398,10 +1478,48 @@ SELECT struct(1, 1) IN (struct(NULL, NULL))
 ----
 false
 
+statement ok
+CREATE OR REPLACE TABLE in_list_str_test(s TEXT) AS VALUES ('alpha'), ('beta'), ('gamma'), (NULL);
+
+query TB
+SELECT s, s IN ('alpha', 'beta') FROM in_list_str_test ORDER BY s;
+----
+alpha true
+beta true
+gamma false
+NULL NULL
+
+query TB
+SELECT s, s NOT IN ('alpha', 'beta') FROM in_list_str_test ORDER BY s;
+----
+alpha false
+beta false
+gamma true
+NULL NULL
+
+query TB
+SELECT s, s IN ('alpha', NULL) FROM in_list_str_test ORDER BY s;
+----
+alpha true
+beta NULL
+gamma NULL
+NULL NULL
+
+query TB
+SELECT s, s NOT IN ('alpha', NULL) FROM in_list_str_test ORDER BY s;
+----
+alpha false
+beta NULL
+gamma NULL
+NULL NULL
+
 # Cleanup test tables
 
 statement ok
 DROP TABLE in_list_test;
+
+statement ok
+DROP TABLE in_list_str_test;
 
 statement ok
 DROP TABLE in_list_col_test;

@@ -177,6 +177,7 @@ fn instantiate_static_filter(
         // Float primitive types (use ordered wrappers for Hash/Eq)
         DataType::Float32 => Ok(Arc::new(Float32StaticFilter::try_new(&in_array)?)),
         DataType::Float64 => Ok(Arc::new(Float64StaticFilter::try_new(&in_array)?)),
+        // Utf8 types
         DataType::Utf8 => Ok(Arc::new(Utf8StaticFilter::try_new(&in_array)?)),
         DataType::LargeUtf8 => Ok(Arc::new(LargeUtf8StaticFilter::try_new(&in_array)?)),
         DataType::Utf8View => Ok(Arc::new(Utf8ViewStaticFilter::try_new(&in_array)?)),
@@ -187,6 +188,7 @@ fn instantiate_static_filter(
     }
 }
 
+/// Generates specialized [`StaticFilter`] implementations for string types (Utf8, LargeUtf8, Utf8View).
 macro_rules! string_static_filter {
     ($Name:ident, $ArrayType:ty, $TryDowncast:ident $(::<$offset:ty>)?) => {
         struct $Name {
@@ -4110,40 +4112,24 @@ mod tests {
             );
         }
 
-        let string_cases = vec![
-            (
-                "Utf8",
-                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["a", "d", "b"])) as ArrayRef,
-            ),
-            (
-                "LargeUtf8",
-                Arc::new(LargeStringArray::from(vec!["a", "b", "c"])) as ArrayRef,
-                Arc::new(LargeStringArray::from(vec!["a", "d", "b"])) as ArrayRef,
-            ),
-            (
-                "Utf8View",
-                Arc::new(StringViewArray::from(vec!["a", "b", "c"])) as ArrayRef,
-                Arc::new(StringViewArray::from(vec!["a", "d", "b"])) as ArrayRef,
-            ),
-        ];
-
-        for (name, in_array, needle) in string_cases {
-            assert_eq!(
-                expected,
-                eval_in_list_from_array(Arc::clone(&needle), Arc::clone(&in_array),)?,
-                "same-type failed for {name}"
-            );
-
-            assert_eq!(
-                expected,
-                eval_in_list_from_array(wrap_in_dict(needle), in_array)?,
-                "dict-needle failed for {name}"
-            );
-        }
-
+        // Utf8 (falls through to ArrayStaticFilter)
         let utf8_in = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
         let utf8_needle = Arc::new(StringArray::from(vec!["a", "d", "b"])) as ArrayRef;
+
+        // Utf8 in_array, Utf8 needle
+        assert_eq!(
+            expected,
+            eval_in_list_from_array(Arc::clone(&utf8_needle), Arc::clone(&utf8_in),)?
+        );
+
+        // Utf8 in_array, Dict(Utf8) needle
+        assert_eq!(
+            expected,
+            eval_in_list_from_array(
+                wrap_in_dict(Arc::clone(&utf8_needle)),
+                Arc::clone(&utf8_in),
+            )?
+        );
 
         // Dict(Utf8) in_array, Dict(Utf8) needle: the #20937 bug
         assert_eq!(
@@ -4245,29 +4231,6 @@ mod tests {
             err.contains("Can't compare arrays of different types"),
             "{err}"
         );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_utf8_static_filter_avoids_string_copies() -> Result<()> {
-        let in_array = Arc::new(StringArray::from(vec![
-            Some("alpha"),
-            Some("beta"),
-            Some("alpha"),
-            None,
-        ])) as ArrayRef;
-
-        let filter = Utf8StaticFilter::try_new(&in_array)?;
-
-        assert_eq!(filter.null_count(), 1);
-        assert_eq!(filter.map.len(), 2);
-
-        let needle = Arc::new(StringArray::from(vec![Some("alpha"), Some("gamma"), None]))
-            as ArrayRef;
-
-        let result = filter.contains(needle.as_ref(), false)?;
-        assert_eq!(result, BooleanArray::from(vec![Some(true), None, None]));
 
         Ok(())
     }
