@@ -87,3 +87,7 @@ harness = false
 [[bench]]
 name = "count_distinct"
 harness = false
+
+[[bench]]
+name = "median"
+harness = false
