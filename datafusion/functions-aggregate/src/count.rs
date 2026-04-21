@@ -51,6 +51,7 @@ use datafusion_functions_aggregate_common::aggregate::{
     count_distinct::DictionaryCountAccumulator,
     count_distinct::FloatDistinctCountAccumulator,
     count_distinct::PrimitiveDistinctCountAccumulator,
+    count_distinct::SlidingPrimitiveDistinctCountAccumulator,
     groups_accumulator::accumulate::accumulate_indices,
 };
 use datafusion_macros::user_doc;
@@ -420,9 +421,33 @@ impl AggregateUDFImpl for Count {
         args: AccumulatorArgs,
     ) -> Result<Box<dyn Accumulator>> {
         if args.is_distinct {
-            let acc =
-                SlidingDistinctCountAccumulator::try_new(args.return_field.data_type())?;
-            Ok(Box::new(acc))
+            let data_type = args.expr_fields[0].data_type();
+            match data_type {
+                DataType::Int32 => {
+                    Ok(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
+                        Int32Type,
+                    >::new(data_type)))
+                }
+                DataType::Int64 => {
+                    Ok(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
+                        Int64Type,
+                    >::new(data_type)))
+                }
+                DataType::UInt32 => {
+                    Ok(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
+                        UInt32Type,
+                    >::new(data_type)))
+                }
+                DataType::UInt64 => {
+                    Ok(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
+                        UInt64Type,
+                    >::new(data_type)))
+                }
+                _ => {
+                    let acc = SlidingDistinctCountAccumulator::try_new(data_type)?;
+                    Ok(Box::new(acc))
+                }
+            }
         } else {
             let acc = CountAccumulator::new();
             Ok(Box::new(acc))
@@ -858,7 +883,7 @@ mod tests {
 
     use super::*;
     use arrow::{
-        array::{DictionaryArray, Int32Array, NullArray, StringArray},
+        array::{DictionaryArray, Int32Array, NullArray, StringArray, UInt64Array},
         datatypes::{DataType, Field, Int32Type, Schema},
     };
     use datafusion_expr::function::AccumulatorArgs;
@@ -998,6 +1023,70 @@ mod tests {
         acc.update_batch(&[values])?;
         // Expect distinct values {1,2,3} → count = 3
         assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(3)));
+        Ok(())
+    }
+
+    fn assert_sliding_distinct_count_accumulator_from_udaf_uses_input_type(
+        data_type: DataType,
+        values: ArrayRef,
+    ) -> Result<()> {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("f", data_type.clone(), true)]));
+        let expr = Arc::new(Column::new("f", 0));
+        let expr_field = expr.return_field(&schema)?;
+        let args = AccumulatorArgs {
+            return_field: Arc::new(Field::new(
+                "count(distinct f)",
+                DataType::Int64,
+                true,
+            )),
+            schema: &schema,
+            expr_fields: &[expr_field],
+            ignore_nulls: false,
+            order_bys: &[],
+            is_reversed: false,
+            name: "count(distinct f)",
+            is_distinct: true,
+            exprs: &[expr],
+        };
+
+        let mut acc = Count::new().create_sliding_accumulator(args)?;
+        acc.update_batch(&[values])?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(3)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_distinct_count_accumulator_from_udaf_uses_input_type() -> Result<()> {
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(2),
+            Some(2),
+            Some(3),
+            None,
+        ]));
+        assert_sliding_distinct_count_accumulator_from_udaf_uses_input_type(
+            DataType::Int32,
+            values,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_distinct_count_accumulator_from_udaf_uses_unsigned_input_type()
+    -> Result<()> {
+        let values: ArrayRef = Arc::new(UInt64Array::from(vec![
+            Some(1_u64),
+            Some(2_u64),
+            Some(2_u64),
+            Some(3_u64),
+            None,
+        ]));
+        assert_sliding_distinct_count_accumulator_from_udaf_uses_input_type(
+            DataType::UInt64,
+            values,
+        )?;
         Ok(())
     }
 

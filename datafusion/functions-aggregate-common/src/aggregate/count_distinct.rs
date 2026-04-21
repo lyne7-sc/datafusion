@@ -28,3 +28,4 @@ pub use native::BoolArray256DistinctCountAccumulator;
 pub use native::BoolArray256DistinctCountAccumulatorI8;
 pub use native::FloatDistinctCountAccumulator;
 pub use native::PrimitiveDistinctCountAccumulator;
+pub use native::SlidingPrimitiveDistinctCountAccumulator;
