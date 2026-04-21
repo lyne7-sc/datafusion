@@ -232,6 +232,36 @@ fn criterion_benchmark(c: &mut Criterion) {
             })
         },
     );
+
+    c.bench_function("window partition by, u64_mid, count distinct", |b| {
+        b.iter(|| {
+            query(
+                ctx.clone(),
+                &rt,
+                "SELECT \
+                  COUNT(DISTINCT u64_narrow) OVER (PARTITION BY u64_mid) \
+                FROM t",
+            )
+        })
+    });
+
+    c.bench_function(
+        "window partition and order by, u64_mid, count distinct",
+        |b| {
+            b.iter(|| {
+                query(
+                    ctx.clone(),
+                    &rt,
+                    "SELECT \
+                        COUNT(DISTINCT u64_narrow) OVER ( \
+                            PARTITION BY u64_mid ORDER BY u64_wide \
+                            ROWS BETWEEN 100 PRECEDING AND CURRENT ROW \
+                        ) \
+                    FROM t",
+                )
+            })
+        },
+    );
 }
 
 criterion_group!(benches, criterion_benchmark);
