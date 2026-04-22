@@ -33,7 +33,7 @@ use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
 use crate::joins::utils::{
-    OnceFut, equal_rows_arr, get_final_indices_from_shared_bitmap,
+    JoinKeyComparator, OnceFut, get_final_indices_from_shared_bitmap,
 };
 use crate::{
     RecordBatchStream, SendableRecordBatchStream, handle_state,
@@ -307,19 +307,32 @@ pub(super) fn lookup_join_hashmap(
     let probe_indices_unfiltered: UInt32Array =
         std::mem::take(probe_indices_buffer).into();
 
-    // TODO: optimize equal_rows_arr to avoid allocation of intermediate arrays
-    // https://github.com/apache/datafusion/issues/12131
-    let (build_indices, probe_indices) = equal_rows_arr(
-        &build_indices_unfiltered,
-        &probe_indices_unfiltered,
+    // Use JoinKeyComparator for row-level equality
+    let sort_options =
+        vec![arrow::compute::SortOptions::default(); build_side_values.len()];
+    let comparator = JoinKeyComparator::new(
         build_side_values,
         probe_side_values,
+        &sort_options,
         null_equality,
     )?;
 
-    // Reclaim buffers
-    *build_indices_buffer = build_indices_unfiltered.into_parts().1.into();
-    *probe_indices_buffer = probe_indices_unfiltered.into_parts().1.into();
+    // Filter in-place: retain only pairs where build[i] == probe[j].
+    let mut write_idx = 0;
+    for read_idx in 0..build_indices_buffer.len() {
+        let build_row = build_indices_buffer[read_idx] as usize;
+        let probe_row = probe_indices_buffer[read_idx] as usize;
+        if comparator.is_equal(build_row, probe_row) {
+            build_indices_buffer[write_idx] = build_indices_buffer[read_idx];
+            probe_indices_buffer[write_idx] = probe_indices_buffer[read_idx];
+            write_idx += 1;
+        }
+    }
+    build_indices_buffer.truncate(write_idx);
+    probe_indices_buffer.truncate(write_idx);
+
+    let build_indices = std::mem::take(build_indices_buffer).into();
+    let probe_indices = std::mem::take(probe_indices_buffer).into();
 
     Ok((build_indices, probe_indices, next_offset))
 }

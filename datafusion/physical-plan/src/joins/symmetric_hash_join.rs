@@ -41,10 +41,10 @@ use crate::joins::stream_join_utils::{
     get_pruning_semi_indices, prepare_sorted_exprs, record_visited_indices,
 };
 use crate::joins::utils::{
-    BatchSplitter, BatchTransformer, ColumnIndex, JoinFilter, JoinHashMapType, JoinOn,
-    JoinOnRef, NoopBatchTransformer, StatefulStreamResult, apply_join_filter_to_indices,
-    build_batch_from_indices, build_join_schema, check_join_is_valid, equal_rows_arr,
-    symmetric_join_output_partitioning, update_hash,
+    BatchSplitter, BatchTransformer, ColumnIndex, JoinFilter, JoinHashMapType,
+    JoinKeyComparator, JoinOn, JoinOnRef, NoopBatchTransformer, StatefulStreamResult,
+    apply_join_filter_to_indices, build_batch_from_indices, build_join_schema,
+    check_join_is_valid, symmetric_join_output_partitioning, update_hash,
 };
 use crate::projection::{
     ProjectionExec, join_allows_pushdown, join_table_borders, new_join_children,
@@ -1139,16 +1139,31 @@ fn lookup_join_hashmap(
     matched_probe.reverse();
     matched_build.reverse();
 
-    let build_indices: UInt64Array = matched_build.into();
-    let probe_indices: UInt32Array = matched_probe.into();
-
-    let (build_indices, probe_indices) = equal_rows_arr(
-        &build_indices,
-        &probe_indices,
+    let sort_options =
+        vec![arrow::compute::SortOptions::default(); build_join_values.len()];
+    let comparator = JoinKeyComparator::new(
         &build_join_values,
         &keys_values,
+        &sort_options,
         null_equality,
     )?;
+
+    // Filter in-place: retain only pairs where build[i] == probe[j].
+    let mut write_idx = 0;
+    for read_idx in 0..matched_build.len() {
+        let build_row = matched_build[read_idx] as usize;
+        let probe_row = matched_probe[read_idx] as usize;
+        if comparator.is_equal(build_row, probe_row) {
+            matched_build[write_idx] = matched_build[read_idx];
+            matched_probe[write_idx] = matched_probe[read_idx];
+            write_idx += 1;
+        }
+    }
+    matched_build.truncate(write_idx);
+    matched_probe.truncate(write_idx);
+
+    let build_indices: UInt64Array = matched_build.into();
+    let probe_indices: UInt32Array = matched_probe.into();
 
     Ok((build_indices, probe_indices))
 }
@@ -1842,6 +1857,45 @@ mod tests {
         Ok((left_partition, right_partition))
     }
 
+    fn build_dense_duplicate_partitions(
+        num_rows: usize,
+        key_mod: usize,
+        batch_size: usize,
+    ) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("payload", DataType::Int64, false),
+        ]));
+
+        let left_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from_iter_values(
+                    (0..num_rows).map(|i| (i % key_mod) as i32),
+                )),
+                Arc::new(arrow::array::Int64Array::from_iter_values(
+                    (0..num_rows).map(|i| i as i64),
+                )),
+            ],
+        )?;
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from_iter_values(
+                    (0..num_rows).map(|i| (i % key_mod) as i32),
+                )),
+                Arc::new(arrow::array::Int64Array::from_iter_values(
+                    (0..num_rows).map(|i| 1_000_000 + i as i64),
+                )),
+            ],
+        )?;
+
+        Ok((
+            split_record_batches(&left_batch, batch_size)?,
+            split_record_batches(&right_batch, batch_size)?,
+        ))
+    }
+
     pub async fn experiment(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
@@ -2112,6 +2166,45 @@ mod tests {
 
         let on = vec![(col("lc1", left_schema)?, col("rc1", right_schema)?)];
         experiment(left, right, None, join_type, on, task_ctx).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn join_without_filter_dense_duplicates_across_batches() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        let (left_partition, right_partition) =
+            build_dense_duplicate_partitions(8_192, 256, 4_096)?;
+        let left_schema = left_partition[0].schema();
+        let right_schema = right_partition[0].schema();
+        let (left, right) =
+            create_memory_table(left_partition, right_partition, vec![], vec![])?;
+        let on = vec![(col("key", &left_schema)?, col("key", &right_schema)?)];
+        let sym_join = Arc::new(SymmetricHashJoinExec::try_new(
+            Arc::clone(&left),
+            Arc::clone(&right),
+            on.clone(),
+            None,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            None,
+            None,
+            StreamJoinPartitionMode::SinglePartition,
+        )?);
+        let hash_join = Arc::new(crate::joins::HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            crate::joins::PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?);
+
+        let sym_batches = crate::collect(sym_join, Arc::clone(&task_ctx)).await?;
+        let hash_batches = crate::collect(hash_join, task_ctx).await?;
+        compare_batches(&sym_batches, &hash_batches);
         Ok(())
     }
 
