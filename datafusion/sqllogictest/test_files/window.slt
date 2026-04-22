@@ -5826,6 +5826,69 @@ physical_plan
 05)--------RepartitionExec: partitioning=Hash([k@0], 2), input_partitions=2
 06)----------DataSourceExec: partitions=2, partition_sizes=[5, 4]
 
+statement ok
+CREATE TABLE table_test_distinct_count_rows_null (
+    k VARCHAR,
+    seq INT,
+    v INT
+);
+
+statement ok
+INSERT INTO table_test_distinct_count_rows_null (k, seq, v) VALUES
+    ('a', 1, 1),
+    ('a', 2, 1),
+    ('a', 3, NULL),
+    ('a', 4, 2),
+    ('a', 5, 1),
+    ('b', 1, NULL),
+    ('b', 2, 3),
+    ('b', 3, 3),
+    ('b', 4, 4);
+
+query TII
+SELECT
+    k,
+    seq,
+    COUNT(DISTINCT v) OVER (
+        PARTITION BY k
+        ORDER BY seq
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS distinct_count
+FROM table_test_distinct_count_rows_null
+ORDER BY k, seq;
+----
+a 1 1
+a 2 1
+a 3 1
+a 4 2
+a 5 2
+b 1 0
+b 2 1
+b 3 1
+b 4 2
+
+query TT
+EXPLAIN SELECT
+    k,
+    seq,
+    COUNT(DISTINCT v) OVER (
+        PARTITION BY k
+        ORDER BY seq
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS distinct_count
+FROM table_test_distinct_count_rows_null
+ORDER BY k, seq;
+----
+logical_plan
+01)Sort: table_test_distinct_count_rows_null.k ASC NULLS LAST, table_test_distinct_count_rows_null.seq ASC NULLS LAST
+02)--Projection: table_test_distinct_count_rows_null.k, table_test_distinct_count_rows_null.seq, count(DISTINCT table_test_distinct_count_rows_null.v) PARTITION BY [table_test_distinct_count_rows_null.k] ORDER BY [table_test_distinct_count_rows_null.seq ASC NULLS LAST] ROWS BETWEEN 2 PRECEDING AND CURRENT ROW AS distinct_count
+03)----WindowAggr: windowExpr=[[count(DISTINCT table_test_distinct_count_rows_null.v) PARTITION BY [table_test_distinct_count_rows_null.k] ORDER BY [table_test_distinct_count_rows_null.seq ASC NULLS LAST] ROWS BETWEEN 2 PRECEDING AND CURRENT ROW]]
+04)------TableScan: table_test_distinct_count_rows_null projection=[k, seq, v]
+physical_plan
+01)ProjectionExec: expr=[k@0 as k, seq@1 as seq, count(DISTINCT table_test_distinct_count_rows_null.v) PARTITION BY [table_test_distinct_count_rows_null.k] ORDER BY [table_test_distinct_count_rows_null.seq ASC NULLS LAST] ROWS BETWEEN 2 PRECEDING AND CURRENT ROW@3 as distinct_count]
+02)--BoundedWindowAggExec: wdw=[count(DISTINCT table_test_distinct_count_rows_null.v) PARTITION BY [table_test_distinct_count_rows_null.k] ORDER BY [table_test_distinct_count_rows_null.seq ASC NULLS LAST] ROWS BETWEEN 2 PRECEDING AND CURRENT ROW: Field { "count(DISTINCT table_test_distinct_count_rows_null.v) PARTITION BY [table_test_distinct_count_rows_null.k] ORDER BY [table_test_distinct_count_rows_null.seq ASC NULLS LAST] ROWS BETWEEN 2 PRECEDING AND CURRENT ROW": Int64 }, frame: ROWS BETWEEN 2 PRECEDING AND CURRENT ROW], mode=[Sorted]
+03)----SortExec: expr=[k@0 ASC NULLS LAST, seq@1 ASC NULLS LAST], preserve_partitioning=[false]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Add testing for distinct sum
 query TPII
