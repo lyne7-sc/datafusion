@@ -239,7 +239,7 @@ fn count_distinct_sliding_benchmark(c: &mut Criterion) {
     fn bench_sliding_count_distinct(
         c: &mut Criterion,
         cardinality_name: &str,
-        values: ArrayRef,
+        values: &ArrayRef,
         window_size: usize,
     ) {
         let name =
@@ -274,12 +274,7 @@ fn count_distinct_sliding_benchmark(c: &mut Criterion) {
         let values = Arc::new(create_i64_array(n_distinct)) as ArrayRef;
 
         for window_size in window_sizes {
-            bench_sliding_count_distinct(
-                c,
-                cardinality_name,
-                Arc::clone(&values),
-                window_size,
-            );
+            bench_sliding_count_distinct(c, cardinality_name, &values, window_size);
         }
     }
 }
