@@ -268,92 +268,36 @@ fn get_count_accumulator(data_type: &DataType) -> Box<dyn Accumulator> {
     }
 }
 
-fn get_sliding_primitive_distinct_count_accumulator(
+fn get_sliding_distinct_count_accumulator(
     data_type: &DataType,
-) -> Option<Box<dyn Accumulator>> {
-    match data_type {
-        DataType::Int8 => Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-            Int8Type,
-        >::new(data_type))),
-        DataType::Int16 => Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-            Int16Type,
-        >::new(data_type))),
-        DataType::Int32 => Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-            Int32Type,
-        >::new(data_type))),
-        DataType::Int64 => Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-            Int64Type,
-        >::new(data_type))),
-        DataType::UInt8 => Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-            UInt8Type,
-        >::new(data_type))),
-        DataType::UInt16 => Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
+) -> Result<Box<dyn Accumulator>> {
+    Ok(match data_type {
+        DataType::Int8 => Box::new(
+            SlidingPrimitiveDistinctCountAccumulator::<Int8Type>::new(data_type),
+        ),
+        DataType::Int16 => Box::new(
+            SlidingPrimitiveDistinctCountAccumulator::<Int16Type>::new(data_type),
+        ),
+        DataType::Int32 => Box::new(
+            SlidingPrimitiveDistinctCountAccumulator::<Int32Type>::new(data_type),
+        ),
+        DataType::Int64 => Box::new(
+            SlidingPrimitiveDistinctCountAccumulator::<Int64Type>::new(data_type),
+        ),
+        DataType::UInt8 => Box::new(
+            SlidingPrimitiveDistinctCountAccumulator::<UInt8Type>::new(data_type),
+        ),
+        DataType::UInt16 => Box::new(SlidingPrimitiveDistinctCountAccumulator::<
             UInt16Type,
-        >::new(data_type))),
-        DataType::UInt32 => Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
+        >::new(data_type)),
+        DataType::UInt32 => Box::new(SlidingPrimitiveDistinctCountAccumulator::<
             UInt32Type,
-        >::new(data_type))),
-        DataType::UInt64 => Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
+        >::new(data_type)),
+        DataType::UInt64 => Box::new(SlidingPrimitiveDistinctCountAccumulator::<
             UInt64Type,
-        >::new(data_type))),
-        DataType::Decimal128(_, _) => {
-            Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-                Decimal128Type,
-            >::new(data_type)))
-        }
-        DataType::Decimal256(_, _) => {
-            Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-                Decimal256Type,
-            >::new(data_type)))
-        }
-        DataType::Date32 => Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-            Date32Type,
-        >::new(data_type))),
-        DataType::Date64 => Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-            Date64Type,
-        >::new(data_type))),
-        DataType::Time32(TimeUnit::Millisecond) => {
-            Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-                Time32MillisecondType,
-            >::new(data_type)))
-        }
-        DataType::Time32(TimeUnit::Second) => {
-            Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-                Time32SecondType,
-            >::new(data_type)))
-        }
-        DataType::Time64(TimeUnit::Microsecond) => {
-            Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-                Time64MicrosecondType,
-            >::new(data_type)))
-        }
-        DataType::Time64(TimeUnit::Nanosecond) => {
-            Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-                Time64NanosecondType,
-            >::new(data_type)))
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-                TimestampMicrosecondType,
-            >::new(data_type)))
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-                TimestampMillisecondType,
-            >::new(data_type)))
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-                TimestampNanosecondType,
-            >::new(data_type)))
-        }
-        DataType::Timestamp(TimeUnit::Second, _) => {
-            Some(Box::new(SlidingPrimitiveDistinctCountAccumulator::<
-                TimestampSecondType,
-            >::new(data_type)))
-        }
-        _ => None,
-    }
+        >::new(data_type)),
+        _ => Box::new(SlidingDistinctCountAccumulator::try_new(data_type)?),
+    })
 }
 
 /// Uses optimized bitmap accumulators but separated to keep hot path small
@@ -523,14 +467,7 @@ impl AggregateUDFImpl for Count {
         args: AccumulatorArgs,
     ) -> Result<Box<dyn Accumulator>> {
         if args.is_distinct {
-            let data_type = args.expr_fields[0].data_type();
-            if let Some(acc) = get_sliding_primitive_distinct_count_accumulator(data_type)
-            {
-                Ok(acc)
-            } else {
-                let acc = SlidingDistinctCountAccumulator::try_new(data_type)?;
-                Ok(Box::new(acc))
-            }
+            get_sliding_distinct_count_accumulator(args.expr_fields[0].data_type())
         } else {
             let acc = CountAccumulator::new();
             Ok(Box::new(acc))
@@ -1002,7 +939,7 @@ impl Accumulator for DistinctCountAccumulator {
 mod tests {
 
     use super::*;
-    use std::sync::Arc;
+    use std::{any::Any, any::type_name, sync::Arc};
 
     use arrow::{
         array::{DictionaryArray, Int32Array, NullArray, StringArray},
@@ -1146,6 +1083,63 @@ mod tests {
         // Expect distinct values {1,2,3} → count = 3
         assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(3)));
         Ok(())
+    }
+
+    fn create_sliding_distinct_count_accumulator_for_type(
+        data_type: DataType,
+    ) -> Result<Box<dyn Accumulator>> {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("f", data_type.clone(), true)]));
+        let expr = Arc::new(Column::new("f", 0));
+        let expr_field = expr.return_field(&schema)?;
+        let args = AccumulatorArgs {
+            return_field: Arc::new(Field::new(
+                "count(distinct f)",
+                DataType::Int64,
+                true,
+            )),
+            schema: &schema,
+            expr_fields: &[expr_field],
+            ignore_nulls: false,
+            order_bys: &[],
+            is_reversed: false,
+            name: "count(distinct f)",
+            is_distinct: true,
+            exprs: &[expr],
+        };
+
+        Count::new().create_sliding_accumulator(args)
+    }
+
+    fn assert_sliding_distinct_count_accumulator_type<T>(
+        data_type: DataType,
+    ) -> Result<()>
+    where
+        T: Accumulator + 'static,
+    {
+        let acc = create_sliding_distinct_count_accumulator_for_type(data_type)?;
+        let any = acc.as_ref() as &dyn Any;
+        assert!(
+            any.is::<T>(),
+            "expected sliding distinct count accumulator type {}",
+            type_name::<T>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_distinct_count_accumulator_uses_primitive_fast_path_for_int32()
+    -> Result<()> {
+        assert_sliding_distinct_count_accumulator_type::<
+            SlidingPrimitiveDistinctCountAccumulator<Int32Type>,
+        >(DataType::Int32)
+    }
+
+    #[test]
+    fn sliding_distinct_count_accumulator_falls_back_for_date32() -> Result<()> {
+        assert_sliding_distinct_count_accumulator_type::<SlidingDistinctCountAccumulator>(
+            DataType::Date32,
+        )
     }
 
     #[test]
