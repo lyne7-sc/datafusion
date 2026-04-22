@@ -198,6 +198,40 @@ fn criterion_benchmark(c: &mut Criterion) {
             })
         },
     );
+
+    c.bench_function(
+        "window partition and order by, u64_wide, built-in functions",
+        |b| {
+            b.iter(|| {
+                query(
+                    ctx.clone(),
+                    &rt,
+                    "SELECT \
+                        FIRST_VALUE(f64) OVER (PARTITION BY u64_wide ORDER by f64), \
+                        LAST_VALUE(f32) OVER (PARTITION BY u64_wide ORDER by f64), \
+                        NTH_VALUE(u64_narrow, 50) OVER (PARTITION BY u64_wide ORDER by f64) \
+                    FROM t",
+                )
+            })
+        },
+    );
+
+    c.bench_function(
+        "window partition and order by, u64_narrow, built-in functions",
+        |b| {
+            b.iter(|| {
+                query(
+                    ctx.clone(),
+                    &rt,
+                    "SELECT \
+                        FIRST_VALUE(f64) OVER (PARTITION BY u64_narrow ORDER by f64), \
+                        LAST_VALUE(f32) OVER (PARTITION BY u64_narrow ORDER by f64), \
+                        NTH_VALUE(u64_narrow, 50) OVER (PARTITION BY u64_narrow ORDER by f64) \
+                    FROM t",
+                )
+            })
+        },
+    );
 }
 
 criterion_group!(benches, criterion_benchmark);
