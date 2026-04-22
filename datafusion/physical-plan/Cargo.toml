@@ -106,5 +106,10 @@ required-features = ["test_utils"]
 
 [[bench]]
 harness = false
+name = "hash_join"
+required-features = ["test_utils"]
+
+[[bench]]
+harness = false
 name = "aggregate_vectorized"
 required-features = ["test_utils"]
