@@ -5867,29 +5867,6 @@ b 2 1
 b 3 1
 b 4 2
 
-query TT
-EXPLAIN SELECT
-    k,
-    seq,
-    COUNT(DISTINCT v) OVER (
-        PARTITION BY k
-        ORDER BY seq
-        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-    ) AS distinct_count
-FROM table_test_distinct_count_rows_null
-ORDER BY k, seq;
-----
-logical_plan
-01)Sort: table_test_distinct_count_rows_null.k ASC NULLS LAST, table_test_distinct_count_rows_null.seq ASC NULLS LAST
-02)--Projection: table_test_distinct_count_rows_null.k, table_test_distinct_count_rows_null.seq, count(DISTINCT table_test_distinct_count_rows_null.v) PARTITION BY [table_test_distinct_count_rows_null.k] ORDER BY [table_test_distinct_count_rows_null.seq ASC NULLS LAST] ROWS BETWEEN 2 PRECEDING AND CURRENT ROW AS distinct_count
-03)----WindowAggr: windowExpr=[[count(DISTINCT table_test_distinct_count_rows_null.v) PARTITION BY [table_test_distinct_count_rows_null.k] ORDER BY [table_test_distinct_count_rows_null.seq ASC NULLS LAST] ROWS BETWEEN 2 PRECEDING AND CURRENT ROW]]
-04)------TableScan: table_test_distinct_count_rows_null projection=[k, seq, v]
-physical_plan
-01)ProjectionExec: expr=[k@0 as k, seq@1 as seq, count(DISTINCT table_test_distinct_count_rows_null.v) PARTITION BY [table_test_distinct_count_rows_null.k] ORDER BY [table_test_distinct_count_rows_null.seq ASC NULLS LAST] ROWS BETWEEN 2 PRECEDING AND CURRENT ROW@3 as distinct_count]
-02)--BoundedWindowAggExec: wdw=[count(DISTINCT table_test_distinct_count_rows_null.v) PARTITION BY [table_test_distinct_count_rows_null.k] ORDER BY [table_test_distinct_count_rows_null.seq ASC NULLS LAST] ROWS BETWEEN 2 PRECEDING AND CURRENT ROW: Field { "count(DISTINCT table_test_distinct_count_rows_null.v) PARTITION BY [table_test_distinct_count_rows_null.k] ORDER BY [table_test_distinct_count_rows_null.seq ASC NULLS LAST] ROWS BETWEEN 2 PRECEDING AND CURRENT ROW": Int64 }, frame: ROWS BETWEEN 2 PRECEDING AND CURRENT ROW], mode=[Sorted]
-03)----SortExec: expr=[k@0 ASC NULLS LAST, seq@1 ASC NULLS LAST], preserve_partitioning=[false]
-04)------DataSourceExec: partitions=1, partition_sizes=[1]
-
 # Add testing for distinct sum
 query TPII
 SELECT

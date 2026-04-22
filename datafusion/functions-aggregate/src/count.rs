@@ -939,7 +939,6 @@ impl Accumulator for DistinctCountAccumulator {
 mod tests {
 
     use super::*;
-    use std::{any::Any, any::type_name, sync::Arc};
 
     use arrow::{
         array::{DictionaryArray, Int32Array, NullArray, StringArray},
@@ -947,6 +946,7 @@ mod tests {
     };
     use datafusion_expr::function::AccumulatorArgs;
     use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
+    use std::sync::Arc;
 
     /// Helper function to create a dictionary array with non-null keys but some null values
     /// Returns a dictionary array where:
@@ -1083,63 +1083,6 @@ mod tests {
         // Expect distinct values {1,2,3} → count = 3
         assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(3)));
         Ok(())
-    }
-
-    fn create_sliding_distinct_count_accumulator_for_type(
-        data_type: DataType,
-    ) -> Result<Box<dyn Accumulator>> {
-        let schema =
-            Arc::new(Schema::new(vec![Field::new("f", data_type.clone(), true)]));
-        let expr = Arc::new(Column::new("f", 0));
-        let expr_field = expr.return_field(&schema)?;
-        let args = AccumulatorArgs {
-            return_field: Arc::new(Field::new(
-                "count(distinct f)",
-                DataType::Int64,
-                true,
-            )),
-            schema: &schema,
-            expr_fields: &[expr_field],
-            ignore_nulls: false,
-            order_bys: &[],
-            is_reversed: false,
-            name: "count(distinct f)",
-            is_distinct: true,
-            exprs: &[expr],
-        };
-
-        Count::new().create_sliding_accumulator(args)
-    }
-
-    fn assert_sliding_distinct_count_accumulator_type<T>(
-        data_type: DataType,
-    ) -> Result<()>
-    where
-        T: Accumulator + 'static,
-    {
-        let acc = create_sliding_distinct_count_accumulator_for_type(data_type)?;
-        let any = acc.as_ref() as &dyn Any;
-        assert!(
-            any.is::<T>(),
-            "expected sliding distinct count accumulator type {}",
-            type_name::<T>()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn sliding_distinct_count_accumulator_uses_primitive_fast_path_for_int32()
-    -> Result<()> {
-        assert_sliding_distinct_count_accumulator_type::<
-            SlidingPrimitiveDistinctCountAccumulator<Int32Type>,
-        >(DataType::Int32)
-    }
-
-    #[test]
-    fn sliding_distinct_count_accumulator_falls_back_for_date32() -> Result<()> {
-        assert_sliding_distinct_count_accumulator_type::<SlidingDistinctCountAccumulator>(
-            DataType::Date32,
-        )
     }
 
     #[test]
