@@ -652,3 +652,30 @@ where
         .unwrap()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Int32Type};
+
+    #[test]
+    fn sliding_primitive_distinct_count_accumulator_update_retract() {
+        let mut acc =
+            SlidingPrimitiveDistinctCountAccumulator::<Int32Type>::new(&DataType::Int32);
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(2),
+            Some(2),
+            Some(3),
+            None,
+        ]));
+
+        acc.update_batch(&[Arc::clone(&values)]).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(3)));
+
+        let leaving: ArrayRef = Arc::new(Int32Array::from(vec![Some(2), Some(3), None]));
+        acc.retract_batch(&[leaving]).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(2)));
+    }
+}
