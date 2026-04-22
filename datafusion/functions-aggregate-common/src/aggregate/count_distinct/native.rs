@@ -26,8 +26,8 @@ use std::hash::Hash;
 use std::mem::size_of_val;
 use std::sync::Arc;
 
-use arrow::array::ArrayRef;
 use arrow::array::PrimitiveArray;
+use arrow::array::ArrayRef;
 use arrow::array::types::ArrowPrimitiveType;
 use arrow::datatypes::DataType;
 use datafusion_common::hash_utils::RandomState;
@@ -85,11 +85,13 @@ where
         }
 
         let arr = as_primitive_array::<T>(&values[0])?;
-        arr.iter().for_each(|value| {
-            if let Some(value) = value {
+        if arr.null_count() > 0 {
+            arr.iter().flatten().for_each(|value| {
                 self.values.insert(value);
-            }
-        });
+            });
+        } else {
+            self.values.extend(arr.values().iter().copied());
+        }
 
         Ok(())
     }
