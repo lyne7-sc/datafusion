@@ -939,7 +939,6 @@ impl Accumulator for DistinctCountAccumulator {
 mod tests {
 
     use super::*;
-
     use arrow::{
         array::{DictionaryArray, Int32Array, NullArray, StringArray},
         datatypes::{DataType, Field, Int32Type, Schema},
@@ -947,7 +946,6 @@ mod tests {
     use datafusion_expr::function::AccumulatorArgs;
     use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
     use std::sync::Arc;
-
     /// Helper function to create a dictionary array with non-null keys but some null values
     /// Returns a dictionary array where:
     /// - keys are [0, 1, 2, 0, 1] (all non-null)
