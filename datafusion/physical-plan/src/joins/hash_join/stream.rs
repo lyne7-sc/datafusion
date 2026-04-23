@@ -302,11 +302,6 @@ pub(super) fn lookup_join_hashmap(
         build_indices_buffer,
     );
 
-    let build_indices_unfiltered: UInt64Array =
-        std::mem::take(build_indices_buffer).into();
-    let probe_indices_unfiltered: UInt32Array =
-        std::mem::take(probe_indices_buffer).into();
-
     // Use JoinKeyComparator for row-level equality
     let sort_options =
         vec![arrow::compute::SortOptions::default(); build_side_values.len()];

@@ -5896,6 +5896,56 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_hash_map_path_preserves_matches() -> Result<()> {
+        let task_ctx = prepare_task_ctx(8192, false);
+        let (left_schema, right_schema, on) = build_schema_and_on()?;
+
+        let left_batch = RecordBatch::try_new(
+            Arc::clone(&left_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+            ],
+        )?;
+        let left = TestMemoryExec::try_new_exec(&[vec![left_batch]], left_schema, None)?;
+
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![20, 30])) as ArrayRef,
+            ],
+        )?;
+        let right =
+            TestMemoryExec::try_new_exec(&[vec![right_batch]], right_schema, None)?;
+
+        let (columns, batches, metrics) = join_collect(
+            left,
+            right,
+            on,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            task_ctx,
+        )
+        .await?;
+
+        assert_eq!(columns, vec!["a1", "b1", "a2", "b1"]);
+        assert_batches_sorted_eq!(
+            [
+                "+----+----+----+----+",
+                "| a1 | b1 | a2 | b1 |",
+                "+----+----+----+----+",
+                "| 2  | 20 | 3  | 20 |",
+                "+----+----+----+----+",
+            ],
+            &batches
+        );
+        assert_phj_used(&metrics, false);
+
+        Ok(())
+    }
+
     /// Test null-aware anti join when probe side (right) contains NULL
     /// Expected: no rows should be output (NULL in subquery means all results are unknown)
     #[apply(hash_join_exec_configs)]
