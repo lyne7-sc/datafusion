@@ -81,7 +81,7 @@ fn two_key_schema() -> SchemaRef {
     ]))
 }
 
-fn split_batch(batch: RecordBatch) -> Vec<RecordBatch> {
+fn split_batch(batch: &RecordBatch) -> Vec<RecordBatch> {
     let mut batches = Vec::new();
     let mut offset = 0;
     while offset < batch.num_rows() {
@@ -107,7 +107,7 @@ where
     .unwrap();
     JoinInput {
         schema,
-        batches: split_batch(batch),
+        batches: split_batch(&batch),
     }
 }
 
@@ -133,13 +133,13 @@ where
     .unwrap();
     JoinInput {
         schema,
-        batches: split_batch(batch),
+        batches: split_batch(&batch),
     }
 }
 
 fn make_exec(input: &JoinInput) -> Arc<dyn ExecutionPlan> {
     TestMemoryExec::try_new_exec(
-        &[input.batches.clone()],
+        std::slice::from_ref(&input.batches),
         Arc::clone(&input.schema),
         None,
     )

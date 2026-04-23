@@ -43,7 +43,7 @@ pub use crate::joins::{JoinOn, JoinOnRef};
 use arrow::array::{
     Array, ArrowPrimitiveType, BooleanBufferBuilder, NativeAdapter, PrimitiveArray,
     RecordBatch, RecordBatchOptions, UInt32Array, UInt32Builder, UInt64Array,
-    builder::UInt64Builder, downcast_array, new_null_array,
+    builder::UInt64Builder, downcast_array, downcast_primitive, new_null_array,
 };
 use arrow::array::{
     ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
@@ -79,6 +79,8 @@ use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, ready};
 use parking_lot::Mutex;
+
+type DynEqComparator = Box<dyn Fn(usize, usize) -> bool + Send + Sync>;
 
 /// Checks whether the schemas "left" and "right" and columns "on" represent a valid join.
 /// They are valid whenever their columns' intersection equals the set `on`
@@ -1871,6 +1873,329 @@ pub fn update_hash(
     Ok(())
 }
 
+fn logical_nulls(array: &dyn Array) -> Option<NullBuffer> {
+    array.logical_nulls().filter(|nulls| nulls.null_count() > 0)
+}
+
+fn wrap_eq_comparator<F>(
+    left_nulls: Option<NullBuffer>,
+    right_nulls: Option<NullBuffer>,
+    null_equality: NullEquality,
+    inner: F,
+) -> DynEqComparator
+where
+    F: Fn(usize, usize) -> bool + Send + Sync + 'static,
+{
+    match (left_nulls, right_nulls) {
+        (None, None) => Box::new(inner),
+        (Some(left_nulls), None) => {
+            Box::new(move |i, j| !left_nulls.is_null(i) && inner(i, j))
+        }
+        (None, Some(right_nulls)) => {
+            Box::new(move |i, j| !right_nulls.is_null(j) && inner(i, j))
+        }
+        (Some(left_nulls), Some(right_nulls)) => match null_equality {
+            NullEquality::NullEqualsNothing => Box::new(move |i, j| {
+                !left_nulls.is_null(i) && !right_nulls.is_null(j) && inner(i, j)
+            }),
+            NullEquality::NullEqualsNull => Box::new(move |i, j| {
+                let left_is_null = left_nulls.is_null(i);
+                let right_is_null = right_nulls.is_null(j);
+                if left_is_null || right_is_null {
+                    left_is_null && right_is_null
+                } else {
+                    inner(i, j)
+                }
+            }),
+        },
+    }
+}
+
+fn make_primitive_eq<T>(
+    left: &dyn Array,
+    right: &dyn Array,
+    null_equality: NullEquality,
+) -> DynEqComparator
+where
+    T: ArrowPrimitiveType,
+    T::Native: PartialEq,
+{
+    let left = left
+        .as_any()
+        .downcast_ref::<PrimitiveArray<T>>()
+        .unwrap()
+        .clone();
+    let right = right
+        .as_any()
+        .downcast_ref::<PrimitiveArray<T>>()
+        .unwrap()
+        .clone();
+    let left_nulls = logical_nulls(&left);
+    let right_nulls = logical_nulls(&right);
+    wrap_eq_comparator(left_nulls, right_nulls, null_equality, move |i, j| unsafe {
+        left.value_unchecked(i) == right.value_unchecked(j)
+    })
+}
+
+fn make_boolean_eq(
+    left: &dyn Array,
+    right: &dyn Array,
+    null_equality: NullEquality,
+) -> DynEqComparator {
+    let left = left
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
+        .clone();
+    let right = right
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap()
+        .clone();
+    let left_nulls = logical_nulls(&left);
+    let right_nulls = logical_nulls(&right);
+    wrap_eq_comparator(left_nulls, right_nulls, null_equality, move |i, j| unsafe {
+        left.value_unchecked(i) == right.value_unchecked(j)
+    })
+}
+
+fn make_string_eq(
+    left: &dyn Array,
+    right: &dyn Array,
+    null_equality: NullEquality,
+) -> DynEqComparator {
+    let left = left.as_any().downcast_ref::<StringArray>().unwrap().clone();
+    let right = right
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .clone();
+    let left_nulls = logical_nulls(&left);
+    let right_nulls = logical_nulls(&right);
+    wrap_eq_comparator(left_nulls, right_nulls, null_equality, move |i, j| unsafe {
+        left.value_unchecked(i) == right.value_unchecked(j)
+    })
+}
+
+fn make_large_string_eq(
+    left: &dyn Array,
+    right: &dyn Array,
+    null_equality: NullEquality,
+) -> DynEqComparator {
+    let left = left
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .unwrap()
+        .clone();
+    let right = right
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .unwrap()
+        .clone();
+    let left_nulls = logical_nulls(&left);
+    let right_nulls = logical_nulls(&right);
+    wrap_eq_comparator(left_nulls, right_nulls, null_equality, move |i, j| unsafe {
+        left.value_unchecked(i) == right.value_unchecked(j)
+    })
+}
+
+fn make_string_view_eq(
+    left: &dyn Array,
+    right: &dyn Array,
+    null_equality: NullEquality,
+) -> DynEqComparator {
+    let left = left
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .unwrap()
+        .clone();
+    let right = right
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .unwrap()
+        .clone();
+    let left_nulls = logical_nulls(&left);
+    let right_nulls = logical_nulls(&right);
+    wrap_eq_comparator(left_nulls, right_nulls, null_equality, move |i, j| unsafe {
+        left.value_unchecked(i) == right.value_unchecked(j)
+    })
+}
+
+fn make_binary_eq(
+    left: &dyn Array,
+    right: &dyn Array,
+    null_equality: NullEquality,
+) -> DynEqComparator {
+    let left = left.as_any().downcast_ref::<BinaryArray>().unwrap().clone();
+    let right = right
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap()
+        .clone();
+    let left_nulls = logical_nulls(&left);
+    let right_nulls = logical_nulls(&right);
+    wrap_eq_comparator(left_nulls, right_nulls, null_equality, move |i, j| unsafe {
+        left.value_unchecked(i) == right.value_unchecked(j)
+    })
+}
+
+fn make_large_binary_eq(
+    left: &dyn Array,
+    right: &dyn Array,
+    null_equality: NullEquality,
+) -> DynEqComparator {
+    let left = left
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .unwrap()
+        .clone();
+    let right = right
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .unwrap()
+        .clone();
+    let left_nulls = logical_nulls(&left);
+    let right_nulls = logical_nulls(&right);
+    wrap_eq_comparator(left_nulls, right_nulls, null_equality, move |i, j| unsafe {
+        left.value_unchecked(i) == right.value_unchecked(j)
+    })
+}
+
+fn make_binary_view_eq(
+    left: &dyn Array,
+    right: &dyn Array,
+    null_equality: NullEquality,
+) -> DynEqComparator {
+    let left = left
+        .as_any()
+        .downcast_ref::<BinaryViewArray>()
+        .unwrap()
+        .clone();
+    let right = right
+        .as_any()
+        .downcast_ref::<BinaryViewArray>()
+        .unwrap()
+        .clone();
+    let left_nulls = logical_nulls(&left);
+    let right_nulls = logical_nulls(&right);
+    wrap_eq_comparator(left_nulls, right_nulls, null_equality, move |i, j| unsafe {
+        left.value_unchecked(i) == right.value_unchecked(j)
+    })
+}
+
+fn make_fixed_size_binary_eq(
+    left: &dyn Array,
+    right: &dyn Array,
+    null_equality: NullEquality,
+) -> DynEqComparator {
+    let left = left
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap()
+        .clone();
+    let right = right
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap()
+        .clone();
+    let left_nulls = logical_nulls(&left);
+    let right_nulls = logical_nulls(&right);
+    wrap_eq_comparator(left_nulls, right_nulls, null_equality, move |i, j| unsafe {
+        left.value_unchecked(i) == right.value_unchecked(j)
+    })
+}
+
+fn make_eq_comparator(
+    left: &dyn Array,
+    right: &dyn Array,
+    null_equality: NullEquality,
+) -> Result<DynEqComparator> {
+    use arrow_schema::DataType::*;
+
+    macro_rules! primitive_eq_helper {
+        ($t:ty, $left:expr, $right:expr) => {
+            Ok(make_primitive_eq::<$t>($left, $right, null_equality))
+        };
+    }
+
+    downcast_primitive! {
+        left.data_type(), right.data_type() => (primitive_eq_helper, left, right),
+        (Null, Null) => Ok(wrap_eq_comparator(
+            logical_nulls(left),
+            logical_nulls(right),
+            null_equality,
+            |_i, _j| true,
+        )),
+        (Boolean, Boolean) => Ok(make_boolean_eq(left, right, null_equality)),
+        (Utf8, Utf8) => Ok(make_string_eq(left, right, null_equality)),
+        (LargeUtf8, LargeUtf8) => Ok(make_large_string_eq(left, right, null_equality)),
+        (Utf8View, Utf8View) => Ok(make_string_view_eq(left, right, null_equality)),
+        (Binary, Binary) => Ok(make_binary_eq(left, right, null_equality)),
+        (LargeBinary, LargeBinary) => Ok(make_large_binary_eq(left, right, null_equality)),
+        (BinaryView, BinaryView) => Ok(make_binary_view_eq(left, right, null_equality)),
+        (FixedSizeBinary(_), FixedSizeBinary(_)) => {
+            Ok(make_fixed_size_binary_eq(left, right, null_equality))
+        },
+        (lhs, rhs) => Err(arrow_schema::ArrowError::InvalidArgumentError(match lhs == rhs {
+            true => format!("The data type type {lhs:?} has no natural order"),
+            false => "Can't compare arrays of different types".to_string(),
+        })),
+    }.or_else(|_| {
+        let cmp = make_comparator(left, right, SortOptions::default())?;
+        Ok(wrap_eq_comparator(
+            logical_nulls(left),
+            logical_nulls(right),
+            null_equality,
+            move |i, j| cmp(i, j) == Ordering::Equal,
+        ))
+    })
+}
+
+/// Pre-built equality-only comparator for join key columns that avoids
+/// constructing lexicographic order when callers only need equality checks.
+pub struct EqOnlyJoinKeyComparator {
+    first: DynEqComparator,
+    rest: Vec<DynEqComparator>,
+}
+
+impl EqOnlyJoinKeyComparator {
+    /// Build equality comparators for each join key column pair.
+    pub fn new(
+        left_arrays: &[ArrayRef],
+        right_arrays: &[ArrayRef],
+        null_equality: NullEquality,
+    ) -> Result<Self> {
+        debug_assert_eq!(left_arrays.len(), right_arrays.len());
+
+        let mut iter =
+            left_arrays
+                .iter()
+                .zip(right_arrays.iter())
+                .map(|(left, right)| {
+                    make_eq_comparator(left.as_ref(), right.as_ref(), null_equality)
+                });
+
+        let first = iter.next().expect("join must have at least one key")?;
+        let rest = iter.collect::<Result<Vec<_>>>()?;
+        Ok(Self { first, rest })
+    }
+
+    /// Check equality of row `left` (in the left arrays) with row `right`
+    /// (in the right arrays).
+    #[inline]
+    pub fn is_equal(&self, left: usize, right: usize) -> bool {
+        if !(self.first)(left, right) {
+            return false;
+        }
+        for eq_fn in &self.rest {
+            if !eq_fn(left, right) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Pre-built comparator for join key columns that eliminates per-row type
 /// dispatch. Wraps `arrow_ord::ord::DynComparator` closures built once per
 /// short-circuit without entering the loop when the first column is
@@ -2071,6 +2396,7 @@ mod tests {
 
     use super::*;
 
+    use arrow::array::StructArray;
     use arrow::datatypes::{DataType, Fields};
     use arrow::error::{ArrowError, Result as ArrowResult};
     use datafusion_common::stats::Precision::{Absent, Exact, Inexact};
@@ -3484,6 +3810,75 @@ mod tests {
         .unwrap();
         assert_eq!(cmp_nl.compare(0, 0), Ordering::Greater);
         assert_eq!(cmp_nl.compare(1, 1), Ordering::Less);
+    }
+
+    #[test]
+    fn test_eq_only_join_key_comparator_multi_column() {
+        let left_a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 2, 3]));
+        let left_b: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c", "d"]));
+        let right_a: ArrayRef = Arc::new(Int32Array::from(vec![2, 2, 3, 4]));
+        let right_b: ArrayRef = Arc::new(StringArray::from(vec!["b", "d", "a", "a"]));
+
+        let cmp = EqOnlyJoinKeyComparator::new(
+            &[left_a, left_b],
+            &[right_a, right_b],
+            NullEquality::NullEqualsNull,
+        )
+        .unwrap();
+
+        assert!(cmp.is_equal(1, 0));
+        assert!(!cmp.is_equal(2, 1));
+        assert!(!cmp.is_equal(3, 0));
+    }
+
+    #[test]
+    fn test_eq_only_join_key_comparator_null_equals_nothing() {
+        let left: ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(1), None, None, Some(2)]));
+        let right: ArrayRef =
+            Arc::new(Int32Array::from(vec![None, None, Some(1), Some(2)]));
+
+        let cmp = EqOnlyJoinKeyComparator::new(
+            &[left],
+            &[right],
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap();
+
+        assert!(!cmp.is_equal(1, 1));
+        assert!(cmp.is_equal(0, 2));
+        assert!(cmp.is_equal(3, 3));
+    }
+
+    #[test]
+    fn test_eq_only_join_key_comparator_struct() {
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let left: ArrayRef = Arc::new(StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec![Some("x"), Some("y")])),
+            ],
+            None,
+        ));
+        let right: ArrayRef = Arc::new(StructArray::new(
+            fields,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec![Some("x"), Some("z")])),
+            ],
+            None,
+        ));
+
+        let cmp =
+            EqOnlyJoinKeyComparator::new(&[left], &[right], NullEquality::NullEqualsNull)
+                .unwrap();
+
+        assert!(cmp.is_equal(0, 0));
+        assert!(!cmp.is_equal(1, 1));
     }
 
     #[test]

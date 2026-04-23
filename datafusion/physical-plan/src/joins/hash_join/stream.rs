@@ -33,7 +33,7 @@ use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
 use crate::joins::utils::{
-    JoinKeyComparator, OnceFut, get_final_indices_from_shared_bitmap,
+    EqOnlyJoinKeyComparator, OnceFut, get_final_indices_from_shared_bitmap,
 };
 use crate::{
     RecordBatchStream, SendableRecordBatchStream, handle_state,
@@ -302,13 +302,9 @@ pub(super) fn lookup_join_hashmap(
         build_indices_buffer,
     );
 
-    // Use JoinKeyComparator for row-level equality
-    let sort_options =
-        vec![arrow::compute::SortOptions::default(); build_side_values.len()];
-    let comparator = JoinKeyComparator::new(
+    let comparator = EqOnlyJoinKeyComparator::new(
         build_side_values,
         probe_side_values,
-        &sort_options,
         null_equality,
     )?;
 

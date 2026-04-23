@@ -41,8 +41,8 @@ use crate::joins::stream_join_utils::{
     get_pruning_semi_indices, prepare_sorted_exprs, record_visited_indices,
 };
 use crate::joins::utils::{
-    BatchSplitter, BatchTransformer, ColumnIndex, JoinFilter, JoinHashMapType,
-    JoinKeyComparator, JoinOn, JoinOnRef, NoopBatchTransformer, StatefulStreamResult,
+    BatchSplitter, BatchTransformer, ColumnIndex, EqOnlyJoinKeyComparator, JoinFilter,
+    JoinHashMapType, JoinOn, JoinOnRef, NoopBatchTransformer, StatefulStreamResult,
     apply_join_filter_to_indices, build_batch_from_indices, build_join_schema,
     check_join_is_valid, symmetric_join_output_partitioning, update_hash,
 };
@@ -1139,14 +1139,8 @@ fn lookup_join_hashmap(
     matched_probe.reverse();
     matched_build.reverse();
 
-    let sort_options =
-        vec![arrow::compute::SortOptions::default(); build_join_values.len()];
-    let comparator = JoinKeyComparator::new(
-        &build_join_values,
-        &keys_values,
-        &sort_options,
-        null_equality,
-    )?;
+    let comparator =
+        EqOnlyJoinKeyComparator::new(&build_join_values, &keys_values, null_equality)?;
 
     // Filter in-place: retain only pairs where build[i] == probe[j].
     let mut write_idx = 0;
