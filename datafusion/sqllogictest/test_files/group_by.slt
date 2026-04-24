@@ -4635,6 +4635,78 @@ DROP TABLE timestamp_table;
 # - UInt32
 # - UInt64
 
+# Plain small-range integer columns should use the single-column direct lookup
+# group values path and still preserve null grouping semantics.
+
+statement ok
+CREATE TABLE plain_int8_groups AS VALUES
+(arrow_cast(-2, 'Int8')),
+(NULL),
+(arrow_cast(-2, 'Int8')),
+(arrow_cast(3, 'Int8')),
+(NULL);
+
+query II
+SELECT column1, COUNT(*) FROM plain_int8_groups GROUP BY column1 ORDER BY column1 NULLS LAST;
+----
+-2 2
+3 1
+NULL 2
+
+statement ok
+DROP TABLE plain_int8_groups;
+
+statement ok
+CREATE TABLE plain_uint8_groups AS VALUES
+(arrow_cast(2, 'UInt8')),
+(NULL),
+(arrow_cast(2, 'UInt8')),
+(arrow_cast(7, 'UInt8')),
+(NULL);
+
+query II
+SELECT column1, COUNT(*) FROM plain_uint8_groups GROUP BY column1 ORDER BY column1 NULLS LAST;
+----
+2 2
+7 1
+NULL 2
+
+statement ok
+DROP TABLE plain_uint8_groups;
+
+statement ok
+CREATE TABLE plain_int16_groups AS VALUES
+(arrow_cast(-12, 'Int16')),
+(NULL),
+(arrow_cast(-12, 'Int16')),
+(arrow_cast(33, 'Int16')),
+(NULL);
+
+query II
+SELECT column1, COUNT(*) FROM plain_int16_groups GROUP BY column1 ORDER BY column1 NULLS LAST;
+----
+-12 2
+33 1
+NULL 2
+
+statement ok
+DROP TABLE plain_int16_groups;
+
+statement ok
+CREATE TABLE plain_uint16_groups AS VALUES
+(arrow_cast(12, 'UInt16')),
+(NULL),
+(arrow_cast(12, 'UInt16')),
+(arrow_cast(33, 'UInt16')),
+(NULL);
+
+query II
+SELECT column1, COUNT(*) FROM plain_uint16_groups GROUP BY column1 ORDER BY column1 NULLS LAST;
+----
+12 2
+33 1
+NULL 2
+
 # Table with an int column and Dict<Int8> column:
 statement ok
 CREATE TABLE int8_dict AS VALUES
