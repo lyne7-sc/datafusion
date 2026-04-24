@@ -18,9 +18,10 @@
 //! [`GroupValues`] trait for storing and interning group keys
 
 use arrow::array::types::{
-    Date32Type, Date64Type, Decimal128Type, Time32MillisecondType, Time32SecondType,
-    Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
-    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
+    Date32Type, Date64Type, Decimal128Type, Int8Type, Int16Type, Time32MillisecondType,
+    Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType, UInt8Type, UInt16Type,
 };
 use arrow::array::{ArrayRef, downcast_primitive};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
@@ -42,6 +43,7 @@ use crate::aggregates::{
     group_values::single_group_by::{
         boolean::GroupValuesBoolean, bytes::GroupValuesBytes,
         bytes_view::GroupValuesBytesView, primitive::GroupValuesPrimitive,
+        primitive_small::GroupValuesPrimitiveSmall,
     },
     order::GroupOrdering,
 };
@@ -144,12 +146,27 @@ pub fn new_group_values(
             };
         }
 
-        downcast_primitive! {
-            d => (downcast_helper, d),
-            _ => {}
-        }
-
         match d {
+            DataType::Int8 => {
+                return Ok(Box::new(GroupValuesPrimitiveSmall::<Int8Type>::new(
+                    d.clone(),
+                )));
+            }
+            DataType::UInt8 => {
+                return Ok(Box::new(GroupValuesPrimitiveSmall::<UInt8Type>::new(
+                    d.clone(),
+                )));
+            }
+            DataType::Int16 => {
+                return Ok(Box::new(GroupValuesPrimitiveSmall::<Int16Type>::new(
+                    d.clone(),
+                )));
+            }
+            DataType::UInt16 => {
+                return Ok(Box::new(GroupValuesPrimitiveSmall::<UInt16Type>::new(
+                    d.clone(),
+                )));
+            }
             DataType::Date32 => {
                 downcast_helper!(Date32Type, d);
             }
@@ -196,6 +213,11 @@ pub fn new_group_values(
             DataType::Boolean => {
                 return Ok(Box::new(GroupValuesBoolean::new()));
             }
+            _ => {}
+        }
+
+        downcast_primitive! {
+            d => (downcast_helper, d),
             _ => {}
         }
     }
