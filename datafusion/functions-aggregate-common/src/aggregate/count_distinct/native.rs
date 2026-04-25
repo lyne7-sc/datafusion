@@ -85,6 +85,9 @@ where
         }
 
         let arr = as_primitive_array::<T>(&values[0])?;
+        // Fast path: no nulls in this batch, validity checks can be skipped.
+        // Earlier batches with nulls do not affect correctness because distinct
+        // accumulation is order-independent.
         if arr.null_count() > 0 {
             arr.iter().flatten().for_each(|value| {
                 self.values.insert(value);
@@ -588,7 +591,12 @@ where
         let arr = as_primitive_array::<T>(&values[0])?;
         if arr.null_count() == 0 {
             for value in arr.values().iter() {
-                if let Some(count) = self.counts.get_mut(value) {
+                let count = self.counts.get_mut(value);
+                debug_assert!(
+                    count.is_some(),
+                    "retract_batch called for a value not in the accumulator"
+                );
+                if let Some(count) = count {
                     *count -= 1;
                     if *count == 0 {
                         self.counts.remove(value);
@@ -599,7 +607,12 @@ where
             for idx in 0..arr.len() {
                 if arr.is_valid(idx) {
                     let value = arr.value(idx);
-                    if let Some(count) = self.counts.get_mut(&value) {
+                    let count = self.counts.get_mut(&value);
+                    debug_assert!(
+                        count.is_some(),
+                        "retract_batch called for a value not in the accumulator"
+                    );
+                    if let Some(count) = count {
                         *count -= 1;
                         if *count == 0 {
                             self.counts.remove(&value);
