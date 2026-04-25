@@ -75,6 +75,23 @@ fn create_i64_array(n_distinct: usize) -> Int64Array {
         .collect()
 }
 
+fn create_i64_array_with_nulls(
+    n_distinct: usize,
+    null_period: usize,
+    nulls_per_period: usize,
+) -> Int64Array {
+    let mut rng = StdRng::seed_from_u64(42);
+    (0..BATCH_SIZE)
+        .map(|idx| {
+            if idx % null_period < nulls_per_period {
+                None
+            } else {
+                Some(rng.random_range(0..n_distinct as i64))
+            }
+        })
+        .collect()
+}
+
 fn create_u8_array(n_distinct: usize) -> UInt8Array {
     let mut rng = StdRng::seed_from_u64(42);
     let max_val = n_distinct.min(256) as u8;
@@ -159,6 +176,25 @@ fn count_distinct_benchmark(c: &mut Criterion) {
                     .unwrap()
             })
         });
+    }
+
+    for (null_label, nulls_per_period) in [("10% nulls", 1), ("30% nulls", 3)] {
+        let values = Arc::new(create_i64_array_with_nulls(
+            BATCH_SIZE * 80 / 100,
+            10,
+            nulls_per_period,
+        )) as ArrayRef;
+        c.bench_function(
+            &format!("count_distinct i64 80% distinct {null_label}"),
+            |b| {
+                b.iter(|| {
+                    let mut accumulator = prepare_accumulator(DataType::Int64);
+                    accumulator
+                        .update_batch(std::slice::from_ref(&values))
+                        .unwrap()
+                })
+            },
+        );
     }
 
     // Small integer types
@@ -273,6 +309,19 @@ fn count_distinct_sliding_benchmark(c: &mut Criterion) {
         let n_distinct = BATCH_SIZE * distinct_pct / 100;
         let values = Arc::new(create_i64_array(n_distinct)) as ArrayRef;
 
+        for window_size in window_sizes {
+            bench_sliding_count_distinct(c, cardinality_name, &values, window_size);
+        }
+    }
+
+    for (cardinality_name, nulls_per_period) in
+        [("mid_10pct_nulls", 1), ("mid_30pct_nulls", 3)]
+    {
+        let values = Arc::new(create_i64_array_with_nulls(
+            BATCH_SIZE * 80 / 100,
+            10,
+            nulls_per_period,
+        )) as ArrayRef;
         for window_size in window_sizes {
             bench_sliding_count_distinct(c, cardinality_name, &values, window_size);
         }
