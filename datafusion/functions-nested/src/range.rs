@@ -547,6 +547,10 @@ fn generate_range_values(
     include_upper: bool,
     values: &mut Vec<i64>,
 ) {
+    if !include_upper && start == stop {
+        return;
+    }
+
     if step > 0 {
         let limit = if include_upper {
             stop
