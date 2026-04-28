@@ -556,6 +556,8 @@ fn generate_range_values(
         if start > limit {
             return;
         }
+        let count = ((limit - start) as u64 / step as u64 + 1) as usize;
+        values.reserve(count);
         let mut current = start;
         while current <= limit {
             values.push(current);
@@ -573,6 +575,8 @@ fn generate_range_values(
         if start < limit {
             return;
         }
+        let count = ((limit - start) as u64 / step as u64 + 1) as usize;
+        values.reserve(count);
         let mut current = start;
         while current >= limit {
             values.push(current);

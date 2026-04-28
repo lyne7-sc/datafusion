@@ -17,16 +17,12 @@
 
 //! Benchmarks for range and generate_series functions.
 
-use arrow::array::{
-    ArrayRef, Int64Array,
-};
-use arrow::datatypes::{
-    DataType, Field,
-};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use datafusion_common::{config::ConfigOptions, ScalarValue};
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use datafusion_common::{ScalarValue, config::ConfigOptions};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
-use datafusion_functions_nested::range::{gen_series_udf, Range};
+use datafusion_functions_nested::range::{Range, gen_series_udf};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::hint::black_box;
