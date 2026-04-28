@@ -26,10 +26,9 @@ use datafusion_expr::{Accumulator, AggregateUDFImpl};
 use datafusion_functions_aggregate::median::Median;
 use datafusion_physical_expr::expressions::col;
 
-const WINDOW_SIZE: usize = 4096;
 const STEP_SIZE: usize = 128;
 const SLIDES_PER_ITER: usize = 32;
-const STREAM_LEN: usize = WINDOW_SIZE + STEP_SIZE * SLIDES_PER_ITER;
+const WINDOW_SIZES: [usize; 3] = [256, 4096, 16384];
 
 fn prepare_accumulator() -> Box<dyn Accumulator> {
     let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
@@ -61,13 +60,18 @@ fn stream_array(len: usize, null_stride: Option<usize>) -> ArrayRef {
     Arc::new(Float64Array::from(values)) as ArrayRef
 }
 
-#[expect(clippy::needless_pass_by_value)]
-fn sliding_window_bench(c: &mut Criterion, name: &str, stream: ArrayRef) {
+/// Benchmark the sliding window cycle: retract + update + evaluate
+fn sliding_window_bench(
+    c: &mut Criterion,
+    name: &str,
+    window_size: usize,
+    stream: &ArrayRef,
+) {
     c.bench_function(name, |b| {
         b.iter_batched(
             || {
                 let mut accumulator = prepare_accumulator();
-                let initial = stream.slice(0, WINDOW_SIZE);
+                let initial = stream.slice(0, window_size);
                 accumulator
                     .update_batch(std::slice::from_ref(&initial))
                     .unwrap();
@@ -77,7 +81,7 @@ fn sliding_window_bench(c: &mut Criterion, name: &str, stream: ArrayRef) {
                 for slide in 0..SLIDES_PER_ITER {
                     let offset = slide * STEP_SIZE;
                     let retract = stream.slice(offset, STEP_SIZE);
-                    let update = stream.slice(offset + WINDOW_SIZE, STEP_SIZE);
+                    let update = stream.slice(offset + window_size, STEP_SIZE);
                     accumulator
                         .retract_batch(std::slice::from_ref(&retract))
                         .unwrap();
@@ -93,17 +97,25 @@ fn sliding_window_bench(c: &mut Criterion, name: &str, stream: ArrayRef) {
 }
 
 fn median_benchmark(c: &mut Criterion) {
-    sliding_window_bench(
-        c,
-        "median sliding_window f64 no_nulls",
-        stream_array(STREAM_LEN, None),
-    );
+    for window_size in WINDOW_SIZES {
+        let stream_len = window_size + STEP_SIZE * SLIDES_PER_ITER;
+        let stream_no_nulls = stream_array(stream_len, None);
+        let stream_with_nulls = stream_array(stream_len, Some(10));
 
-    sliding_window_bench(
-        c,
-        "median sliding_window f64 with_nulls",
-        stream_array(STREAM_LEN, Some(10)),
-    );
+        sliding_window_bench(
+            c,
+            &format!("median sliding_window f64 no_nulls window_size={window_size}"),
+            window_size,
+            &stream_no_nulls,
+        );
+
+        sliding_window_bench(
+            c,
+            &format!("median sliding_window f64 with_nulls window_size={window_size}"),
+            window_size,
+            &stream_with_nulls,
+        );
+    }
 }
 
 criterion_group!(benches, median_benchmark);
