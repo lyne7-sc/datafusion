@@ -33,8 +33,7 @@ use arrow::{
 };
 use datafusion_common::internal_err;
 use datafusion_common::{
-    Result, exec_datafusion_err, exec_err,
-    utils::take_function_args,
+    Result, exec_datafusion_err, exec_err, utils::take_function_args,
 };
 use datafusion_common::{
     ScalarValue,
@@ -581,7 +580,6 @@ fn generate_range_values(
                 Some(next) => current = next,
                 None => break,
             }
-
         }
     }
 }
