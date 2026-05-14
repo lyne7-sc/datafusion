@@ -253,14 +253,18 @@ fn classify_predicate(expr: &Expr) -> PredicateKind<'_> {
         (Expr::Column(_), Expr::Column(_)) => {
             PredicateKind::ColumnEquality { left, right }
         }
-        (Expr::Column(_), Expr::Literal(_, _)) => PredicateKind::ColumnConstant {
-            column: left,
-            constant: right,
-        },
-        (Expr::Literal(_, _), Expr::Column(_)) => PredicateKind::ColumnConstant {
-            column: right,
-            constant: left,
-        },
+        (Expr::Column(_), Expr::Literal(value, _)) if !value.is_null() => {
+            PredicateKind::ColumnConstant {
+                column: left,
+                constant: right,
+            }
+        }
+        (Expr::Literal(value, _), Expr::Column(_)) if !value.is_null() => {
+            PredicateKind::ColumnConstant {
+                column: right,
+                constant: left,
+            }
+        }
         _ => PredicateKind::Other,
     }
 }
@@ -269,9 +273,9 @@ fn classify_predicate(expr: &Expr) -> PredicateKind<'_> {
 mod tests {
     use std::sync::Arc;
 
-    use datafusion_common::Result;
+    use datafusion_common::{Result, ScalarValue};
     use datafusion_expr::logical_plan::builder::LogicalPlanBuilder;
-    use datafusion_expr::{col, lit};
+    use datafusion_expr::{Expr, col, lit};
 
     use crate::OptimizerContext;
     use crate::assert_optimized_plan_eq_snapshot;
@@ -349,6 +353,22 @@ mod tests {
 
         assert_optimized_plan_equal!(plan, @r"
         Filter: test.a = test.b OR test.a = UInt32(5)
+          TableScan: test
+        ")
+    }
+
+    #[test]
+    fn does_not_propagate_null_literals() -> Result<()> {
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .filter(
+                col("a")
+                    .eq(col("b"))
+                    .and(col("a").eq(Expr::Literal(ScalarValue::Int32(None), None))),
+            )?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Filter: test.a = test.b AND test.a = Int32(NULL)
           TableScan: test
         ")
     }
