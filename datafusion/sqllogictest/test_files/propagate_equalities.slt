@@ -1,0 +1,165 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+statement ok
+set datafusion.explain.logical_plan_only=true;
+
+statement ok
+CREATE TABLE propagate_equalities_t (
+    a INT,
+    b INT,
+    c INT,
+    d INT
+);
+
+statement ok
+INSERT INTO propagate_equalities_t VALUES
+    (5, 5, 5, 1),
+    (5, 6, 5, 2),
+    (6, 5, 5, 3),
+    (NULL, NULL, 5, 4),
+    (5, 5, 6, 5),
+    (10, 10, 10, 6);
+
+# Basic equality propagation: a = b AND a = 5 implies b = 5.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = b AND a = 5;
+----
+logical_plan
+01)Filter: propagate_equalities_t.b = propagate_equalities_t.a AND propagate_equalities_t.a = Int32(5) AND propagate_equalities_t.b = Int32(5)
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# Propagation is transitive across the whole equivalence class.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = b AND b = c AND c = 5;
+----
+logical_plan
+01)Filter: propagate_equalities_t.b = propagate_equalities_t.a AND propagate_equalities_t.c = propagate_equalities_t.b AND propagate_equalities_t.c = Int32(5) AND propagate_equalities_t.b = Int32(5) AND propagate_equalities_t.a = Int32(5)
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# Literal on the left side is normalized and propagated.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = b AND 5 = a;
+----
+logical_plan
+01)Filter: propagate_equalities_t.b = propagate_equalities_t.a AND propagate_equalities_t.a = Int32(5) AND propagate_equalities_t.b = Int32(5)
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# Existing column-constant predicates are not duplicated.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = b AND a = 5 AND b = 5;
+----
+logical_plan
+01)Filter: propagate_equalities_t.b = propagate_equalities_t.a AND propagate_equalities_t.a = Int32(5) AND propagate_equalities_t.b = Int32(5)
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# Unrelated predicates are preserved while constants are propagated.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = b AND b = 5 AND c > 2;
+----
+logical_plan
+01)Filter: propagate_equalities_t.b = propagate_equalities_t.a AND propagate_equalities_t.b = Int32(5) AND propagate_equalities_t.c > Int32(2) AND propagate_equalities_t.a = Int32(5)
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# OR predicates are not split into conjunctions, so no propagation happens.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = b OR a = 5;
+----
+logical_plan
+01)Filter: propagate_equalities_t.b = propagate_equalities_t.a OR propagate_equalities_t.a = Int32(5)
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# Equalities inside an OR branch are not propagated by this rule.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE (a = 5 AND b = a) OR c = 3;
+----
+logical_plan
+01)Filter: propagate_equalities_t.a = Int32(5) AND propagate_equalities_t.b = propagate_equalities_t.a OR propagate_equalities_t.c = Int32(3)
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# Constants inside a nested OR are not propagated through a top-level column equality.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = b AND (a = 5 OR c = 3);
+----
+logical_plan
+01)Filter: propagate_equalities_t.b = propagate_equalities_t.a AND (propagate_equalities_t.a = Int32(5) OR propagate_equalities_t.c = Int32(3))
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# Non-equality predicates are ignored by this rule.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = b AND a > 5;
+----
+logical_plan
+01)Filter: propagate_equalities_t.b = propagate_equalities_t.a AND propagate_equalities_t.a > Int32(5)
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# NULL equality is handled by simplification, not propagated as a literal.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = b AND a = NULL;
+----
+logical_plan
+01)Filter: propagate_equalities_t.b = propagate_equalities_t.a AND Boolean(NULL)
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# Same-column conflicting constants are handled by simplification without
+# requiring a column equivalence class.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = 5 AND a = 10;
+----
+logical_plan EmptyRelation: rows=0
+
+# Different constants are detected by later optimizer passes after propagation.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a = b AND a = 5 AND b = 6;
+----
+logical_plan EmptyRelation: rows=0
+
+# Complex expressions are not treated as equivalence-class members.
+query TT
+EXPLAIN SELECT * FROM propagate_equalities_t WHERE a + 1 = b AND b = 5;
+----
+logical_plan
+01)Filter: CAST(propagate_equalities_t.a AS Int64) + Int64(1) = CAST(propagate_equalities_t.b AS Int64) AND propagate_equalities_t.b = Int32(5)
+02)--TableScan: propagate_equalities_t projection=[a, b, c, d]
+
+# Execute queries with propagated predicates to verify the optimized filters
+# preserve query results, not only plan shape.
+query I
+SELECT d FROM propagate_equalities_t WHERE a = b AND a = 5 ORDER BY d;
+----
+1
+5
+
+query I
+SELECT d FROM propagate_equalities_t WHERE a = b AND b = c AND c = 5 ORDER BY d;
+----
+1
+
+query I
+SELECT d FROM propagate_equalities_t WHERE a = b OR a = 5 ORDER BY d;
+----
+1
+2
+5
+6
+
+query I
+SELECT d FROM propagate_equalities_t WHERE a = b AND a = 5 AND b = 6;
+----
+
+statement ok
+set datafusion.explain.logical_plan_only=false;

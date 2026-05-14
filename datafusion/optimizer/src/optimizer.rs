@@ -49,6 +49,7 @@ use crate::optimize_projections::OptimizeProjections;
 use crate::optimize_unions::OptimizeUnions;
 use crate::plan_signature::LogicalPlanSignature;
 use crate::propagate_empty_relation::PropagateEmptyRelation;
+use crate::propagate_equalities::PropagateEqualities;
 use crate::push_down_filter::PushDownFilter;
 use crate::push_down_limit::PushDownLimit;
 use crate::replace_distinct_aggregate::ReplaceDistinctWithAggregate;
@@ -281,6 +282,7 @@ impl Optimizer {
             Arc::new(RewriteSetComparison::new()),
             Arc::new(OptimizeUnions::new()),
             Arc::new(SimplifyExpressions::new()),
+            Arc::new(PropagateEqualities::new()),
             Arc::new(ReplaceDistinctWithAggregate::new()),
             Arc::new(EliminateJoin::new()),
             Arc::new(DecorrelatePredicateSubquery::new()),

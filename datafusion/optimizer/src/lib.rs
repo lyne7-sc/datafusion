@@ -63,6 +63,7 @@ pub mod optimize_projections;
 pub mod optimize_unions;
 pub mod optimizer;
 pub mod propagate_empty_relation;
+pub mod propagate_equalities;
 pub mod push_down_filter;
 pub mod push_down_limit;
 pub mod replace_distinct_aggregate;
