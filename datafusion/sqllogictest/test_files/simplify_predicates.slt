@@ -84,21 +84,91 @@ EXPLAIN SELECT * FROM test_data WHERE int_col = 7 AND int_col = 6;
 ----
 logical_plan EmptyRelation: rows=0
 
-# TODO: x = 7 AND x < 2 should simplify to false
+# x = 7 AND x < 2 should simplify to false
 query TT
 EXPLAIN SELECT * FROM test_data WHERE int_col = 7 AND int_col < 2;
 ----
-logical_plan
-01)Filter: test_data.int_col = Int32(7) AND test_data.int_col < Int32(2)
-02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
+logical_plan EmptyRelation: rows=0
 
 
-# TODO: x = 7 AND x > 5 should simplify to x = 7
+# x = 7 AND x > 5 should simplify to x = 7
 query TT
 EXPLAIN SELECT * FROM test_data WHERE int_col = 7 AND int_col > 5;
 ----
 logical_plan
-01)Filter: test_data.int_col = Int32(7) AND test_data.int_col > Int32(5)
+01)Filter: test_data.int_col = Int32(7)
+02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
+
+# x = 7 AND x < 7 should simplify to false
+query TT
+EXPLAIN SELECT * FROM test_data WHERE int_col = 7 AND int_col < 7;
+----
+logical_plan EmptyRelation: rows=0
+
+# x = 7 AND x <= 7 should simplify to x = 7
+query TT
+EXPLAIN SELECT * FROM test_data WHERE int_col = 7 AND int_col <= 7;
+----
+logical_plan
+01)Filter: test_data.int_col = Int32(7)
+02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
+
+# x = 7 AND x > 7 should simplify to false
+query TT
+EXPLAIN SELECT * FROM test_data WHERE int_col = 7 AND int_col > 7;
+----
+logical_plan EmptyRelation: rows=0
+
+# x = 7 AND x >= 7 should simplify to x = 7
+query TT
+EXPLAIN SELECT * FROM test_data WHERE int_col = 7 AND int_col >= 7;
+----
+logical_plan
+01)Filter: test_data.int_col = Int32(7)
+02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
+
+# x = 7 AND x > 5 AND x < 10 should simplify to x = 7
+query TT
+EXPLAIN SELECT * FROM test_data WHERE int_col = 7 AND int_col > 5 AND int_col < 10;
+----
+logical_plan
+01)Filter: test_data.int_col = Int32(7)
+02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
+
+# x = 7 AND x > 8 AND x < 10 should simplify to false
+query TT
+EXPLAIN SELECT * FROM test_data WHERE int_col = 7 AND int_col > 8 AND int_col < 10;
+----
+logical_plan EmptyRelation: rows=0
+
+# Literal-on-left equality and range predicates should also simplify
+query TT
+EXPLAIN SELECT * FROM test_data WHERE 7 = int_col AND 5 < int_col;
+----
+logical_plan
+01)Filter: test_data.int_col = Int32(7)
+02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
+
+# String equality can make a compatible range predicate redundant
+query TT
+EXPLAIN SELECT * FROM test_data WHERE str_col = 'banana' AND str_col > 'apple';
+----
+logical_plan
+01)Filter: test_data.str_col = Utf8View("banana")
+02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
+
+# String equality can contradict a range predicate
+query TT
+EXPLAIN SELECT * FROM test_data WHERE str_col = 'banana' AND str_col < 'apple';
+----
+logical_plan EmptyRelation: rows=0
+
+# NULL equality value remains conservative because predicate evaluation is indeterminate
+query TT
+EXPLAIN SELECT * FROM test_data WHERE int_col = NULL AND int_col > 5;
+----
+logical_plan
+01)Filter: Boolean(NULL) AND test_data.int_col > Int32(5)
 02)--TableScan: test_data projection=[int_col, float_col, str_col, date_col, bool_col]
 
 # str_col > 'apple' AND str_col > 'banana' should simplify to str_col > 'banana'

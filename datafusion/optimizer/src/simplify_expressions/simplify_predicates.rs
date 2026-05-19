@@ -27,6 +27,7 @@
 
 use datafusion_common::{Column, Result, ScalarValue};
 use datafusion_expr::{BinaryExpr, Expr, Operator};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 /// Simplifies a list of predicates by removing redundancies.
@@ -137,7 +138,34 @@ fn simplify_column_predicates(predicates: Vec<Expr>) -> Result<Vec<Expr>> {
         if eq_predicates.len() == 1
             || eq_predicates.iter().all(|e| e == &eq_predicates[0])
         {
-            result.push(eq_predicates.pop().unwrap());
+            let eq_pred = eq_predicates.pop().unwrap();
+
+            if let Some(eq_value) = extract_literal_from_eq(&eq_pred) {
+                let range_preds: Vec<&Expr> = greater_predicates
+                    .iter()
+                    .chain(less_predicates.iter())
+                    .collect();
+
+                match evaluate_predicates_with_constant(eq_value, &range_preds)? {
+                    ConstantEvalResult::AllTrue => {
+                        // All range predicates are satisfied; keep only equality
+                        return Ok(vec![eq_pred]);
+                    }
+                    ConstantEvalResult::ContainsFalse => {
+                        // At least one range predicate contradicts; always false
+                        return Ok(vec![Expr::Literal(
+                            ScalarValue::Boolean(Some(false)),
+                            None,
+                        )]);
+                    }
+                    ConstantEvalResult::Indeterminate => {
+                        // Cannot fully evaluate; keep all predicates as-is
+                        result.push(eq_pred);
+                    }
+                }
+            } else {
+                result.push(eq_pred);
+            }
         } else {
             // If they are not the same, add a false predicate
             result.push(Expr::Literal(ScalarValue::Boolean(Some(false)), None));
@@ -167,6 +195,89 @@ fn simplify_column_predicates(predicates: Vec<Expr>) -> Result<Vec<Expr>> {
     }
 
     Ok(result)
+}
+
+enum ConstantEvalResult {
+    AllTrue,
+    ContainsFalse,
+    Indeterminate,
+}
+
+/// Extracts the literal value from an equality predicate.
+fn extract_literal_from_eq(expr: &Expr) -> Option<&ScalarValue> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Eq,
+            right,
+        }) => right.as_literal().or_else(|| left.as_literal()),
+        _ => None,
+    }
+}
+
+/// Evaluates predicates by substituting a constant for the column reference.
+fn evaluate_predicates_with_constant(
+    value: &ScalarValue,
+    predicates: &[&Expr],
+) -> Result<ConstantEvalResult> {
+    if predicates.is_empty() {
+        return Ok(ConstantEvalResult::AllTrue);
+    }
+
+    let mut has_indeterminate = false;
+    for predicate in predicates {
+        match evaluate_predicate_with_constant(value, predicate)? {
+            Some(true) => {}
+            Some(false) => return Ok(ConstantEvalResult::ContainsFalse),
+            None => has_indeterminate = true,
+        }
+    }
+
+    if has_indeterminate {
+        Ok(ConstantEvalResult::Indeterminate)
+    } else {
+        Ok(ConstantEvalResult::AllTrue)
+    }
+}
+
+fn evaluate_predicate_with_constant(
+    value: &ScalarValue,
+    predicate: &Expr,
+) -> Result<Option<bool>> {
+    match predicate {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            if let Some(literal) = right.as_literal() {
+                compare_scalar_values(value, op, literal)
+            } else if let Some(literal) = left.as_literal() {
+                compare_scalar_values(literal, op, value)
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn compare_scalar_values(
+    left: &ScalarValue,
+    op: &Operator,
+    right: &ScalarValue,
+) -> Result<Option<bool>> {
+    if left.is_null() || right.is_null() {
+        return Ok(None);
+    }
+
+    let ordering = left.try_cmp(right)?;
+    let result = match op {
+        Operator::Gt => ordering == Ordering::Greater,
+        Operator::GtEq => matches!(ordering, Ordering::Greater | Ordering::Equal),
+        Operator::Lt => ordering == Ordering::Less,
+        Operator::LtEq => matches!(ordering, Ordering::Less | Ordering::Equal),
+        Operator::Eq => ordering == Ordering::Equal,
+        _ => return Ok(None),
+    };
+
+    Ok(Some(result))
 }
 
 /// Finds the most restrictive predicate from a list based on literal values.
@@ -206,13 +317,11 @@ fn find_most_restrictive_predicate(
                 if let Some(current_best) = best_value {
                     let comparison = scalar.try_cmp(current_best)?;
                     let is_better = if find_greater {
-                        comparison == std::cmp::Ordering::Greater
-                            || (comparison == std::cmp::Ordering::Equal
-                                && op == &Operator::Gt)
+                        comparison == Ordering::Greater
+                            || (comparison == Ordering::Equal && op == &Operator::Gt)
                     } else {
-                        comparison == std::cmp::Ordering::Less
-                            || (comparison == std::cmp::Ordering::Equal
-                                && op == &Operator::Lt)
+                        comparison == Ordering::Less
+                            || (comparison == Ordering::Equal && op == &Operator::Lt)
                     };
 
                     if is_better {
