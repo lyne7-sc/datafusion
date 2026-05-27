@@ -33,6 +33,7 @@ pub mod ensure_requirements;
 // details of `ensure_requirements`. Re-export at the crate root so external test
 // modules keep their public paths.
 pub use ensure_requirements::{enforce_distribution, enforce_sorting};
+pub mod filter_predicate_inference;
 pub mod filter_pushdown;
 pub mod join_selection;
 pub mod limit_pushdown;

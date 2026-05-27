@@ -1147,6 +1147,11 @@ config_namespace! {
         /// predicate push down.
         pub filter_null_join_keys: bool, default = false
 
+        /// When set to true, the physical optimizer will infer additional
+        /// filter predicates from existing predicates and replace infeasible
+        /// filters with an empty execution plan.
+        pub enable_filter_predicate_inference: bool, default = false
+
         /// Should DataFusion repartition data using the aggregate keys to execute aggregates
         /// in parallel using the provided `target_partitions` level
         pub repartition_aggregations: bool, default = true

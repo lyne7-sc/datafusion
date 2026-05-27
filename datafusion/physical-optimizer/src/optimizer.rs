@@ -24,6 +24,7 @@ use crate::aggregate_statistics::AggregateStatistics;
 use crate::combine_partial_final_agg::CombinePartialFinalAggregate;
 use crate::ensure_coop::EnsureCooperative;
 use crate::ensure_requirements::EnsureRequirements;
+use crate::filter_predicate_inference::FilterPredicateInference;
 use crate::filter_pushdown::FilterPushdown;
 use crate::join_selection::JoinSelection;
 use crate::limit_pushdown::LimitPushdown;
@@ -163,6 +164,10 @@ impl PhysicalOptimizer {
             // as that rule may inject other operations in between the different AggregateExecs.
             // Applying the rule early means only directly-connected AggregateExecs must be examined.
             Arc::new(LimitedDistinctAggregation::new()),
+            // The FilterPredicateInference rule infers additional predicates from
+            // existing `FilterExec` predicates. It should run before FilterPushdown so
+            // inferred predicates can also be pushed closer to data sources.
+            Arc::new(FilterPredicateInference::new()),
             // The FilterPushdown rule tries to push down filters as far as it can.
             // For example, it will push down filtering from a `FilterExec` to `DataSourceExec`.
             // Note that this does not push down dynamic filters (such as those created by a `SortExec` operator in TopK mode),

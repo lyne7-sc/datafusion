@@ -25,6 +25,7 @@ mod enforce_distribution;
 mod enforce_sorting;
 mod enforce_sorting_monotonicity;
 mod ensure_requirements;
+mod filter_predicate_inference;
 mod filter_pushdown;
 mod join_selection;
 #[expect(clippy::needless_pass_by_value)]
