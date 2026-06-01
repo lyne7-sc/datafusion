@@ -1206,6 +1206,7 @@ fn is_compare_op(op: Operator) -> bool {
             | Operator::IsNotDistinctFrom
             | Operator::LikeMatch
             | Operator::NotLikeMatch
+            | Operator::ILikeMatch
     )
 }
 
@@ -1508,9 +1509,6 @@ fn build_predicate_expression(
                 Arc::clone(bin_expr.right()),
             )
         } else if let Some(like_expr) = expr.downcast_ref::<phys_expr::LikeExpr>() {
-            if like_expr.case_insensitive() {
-                return unhandled_hook.handle(expr);
-            }
             let op = match (like_expr.negated(), like_expr.case_insensitive()) {
                 (false, false) => Operator::LikeMatch,
                 (true, false) => Operator::NotLikeMatch,
@@ -1639,6 +1637,11 @@ fn build_statistics_expr(
         Operator::LikeMatch => build_like_match(expr_builder).ok_or_else(|| {
             plan_datafusion_err!(
                 "LIKE expression with wildcard at the beginning is not supported"
+            )
+        })?,
+        Operator::ILikeMatch => build_ilike_match(expr_builder).ok_or_else(|| {
+            plan_datafusion_err!(
+                "ILIKE expression is not supported for pruning (only ASCII prefixes are handled)"
             )
         })?,
         Operator::Gt => {
@@ -1838,8 +1841,6 @@ fn build_like_match(
     // column LIKE '%foo%' => min <= '' && '' <= max => true
     // column LIKE 'foo' => min <= 'foo' && 'foo' <= max
 
-    // TODO Handle ILIKE perhaps by making the min lowercase and max uppercase
-    //  this may involve building the physical expressions that call lower() and upper()
     let min_column_expr = expr_builder.min_column_expr().ok()?;
     let max_column_expr = expr_builder.max_column_expr().ok()?;
     let scalar_expr = expr_builder.scalar_expr();
@@ -1863,6 +1864,49 @@ fn build_like_match(
         // the like expression is a literal and can be converted into a comparison
         let bound = string_literal_as(decoded_prefix, target_type);
         (Arc::clone(&bound), bound)
+    };
+    let lower_bound_expr = Arc::new(phys_expr::BinaryExpr::new(
+        lower_bound,
+        Operator::LtEq,
+        Arc::clone(&max_column_expr),
+    ));
+    let upper_bound_expr = Arc::new(phys_expr::BinaryExpr::new(
+        Arc::clone(&min_column_expr),
+        Operator::LtEq,
+        upper_bound,
+    ));
+    let combined = Arc::new(phys_expr::BinaryExpr::new(
+        upper_bound_expr,
+        Operator::And,
+        lower_bound_expr,
+    ));
+    Some(combined)
+}
+
+/// Convert `column ILIKE 'prefix%'` into a statistics range check (ASCII only).
+fn build_ilike_match(
+    expr_builder: &mut PruningExpressionBuilder,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    let min_column_expr = expr_builder.min_column_expr().ok()?;
+    let max_column_expr = expr_builder.max_column_expr().ok()?;
+    let scalar_expr = expr_builder.scalar_expr();
+    let target_type = expr_builder.field.data_type();
+    let s = extract_string_literal(scalar_expr)?;
+    let (decoded_prefix, rest) = split_constant_prefix(s);
+    let has_wildcard = !rest.is_empty();
+    if has_wildcard && decoded_prefix.is_empty() {
+        return None;
+    }
+    if !decoded_prefix.is_ascii() {
+        return None;
+    }
+
+    let lower_bound = string_literal_as(decoded_prefix.to_ascii_uppercase(), target_type);
+    let upper_prefix = decoded_prefix.to_ascii_lowercase();
+    let upper_bound = if has_wildcard {
+        string_literal_as(increment_utf8(&upper_prefix)?, target_type)
+    } else {
+        string_literal_as(upper_prefix, target_type)
     };
     let lower_bound_expr = Arc::new(phys_expr::BinaryExpr::new(
         lower_bound,
@@ -4989,6 +5033,68 @@ mod tests {
             // s1 ["%foo_aaa", "%foo_zzz"] => no rows can pass (not keep)
             false,
         ];
+        prune_with_expr(expr, &schema, &statistics, expected_ret);
+    }
+
+    #[test]
+    fn prune_utf8_ilike_ascii_prefix() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s1", DataType::Utf8, true)]));
+        let statistics = TestStatistics::new().with(
+            "s1",
+            ContainerStats::new_utf8(
+                vec![Some("A"), Some("B"), Some("0"), Some("a"), Some("c")],
+                vec![Some("Az"), Some("Bz"), Some("9"), Some("az"), Some("cz")],
+            ),
+        );
+
+        let expr = col("s1").ilike(lit("a%"));
+        #[rustfmt::skip]
+        let expected_ret = &[
+            // s1 ["A", "Az"] => could match (must keep)
+            true,
+            // s1 ["B", "Bz"] => the conservative ASCII range ["A", "b") spans
+            // uppercase letters between A and b, so this is kept.
+            true,
+            // s1 ["0", "9"] => outside the range, no rows can pass (not keep)
+            false,
+            // s1 ["a", "az"] => could match (must keep)
+            true,
+            // s1 ["c", "cz"] => outside the range, no rows can pass (not keep)
+            false,
+        ];
+        prune_with_expr(expr, &schema, &statistics, expected_ret);
+    }
+
+    #[test]
+    fn prune_utf8_ilike_mixed_statistics() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s1", DataType::Utf8, true)]));
+        let statistics = TestStatistics::new().with(
+            "s1",
+            ContainerStats::new_utf8(
+                vec![
+                    Some("Aardvark"),
+                    Some("aardvark"),
+                    Some("A"),
+                    Some("0"),
+                    Some("åland"),
+                ],
+                vec![
+                    Some("Azure"),
+                    Some("azure"),
+                    Some("z"),
+                    Some("4"),
+                    Some("中"),
+                ],
+            ),
+        );
+
+        let expr = col("s1").ilike(lit("a%"));
+        let expected_ret = &[true, true, true, false, false];
+        prune_with_expr(expr, &schema, &statistics, expected_ret);
+
+        // Non-ASCII pattern: unhandled, keep everything.
+        let expr = col("s1").ilike(lit("å%"));
+        let expected_ret = &[true, true, true, true, true];
         prune_with_expr(expr, &schema, &statistics, expected_ret);
     }
 
