@@ -132,6 +132,27 @@ async fn test_utf8_not_like_suffix_one() {
         .await;
 }
 
+#[tokio::test]
+async fn test_utf8_ilike() {
+    Utf8Test::new(|value| col("a").ilike(lit(value)))
+        .run()
+        .await;
+}
+
+#[tokio::test]
+async fn test_utf8_ilike_prefix() {
+    Utf8Test::new(|value| col("a").ilike(lit(format!("%{value}"))))
+        .run()
+        .await;
+}
+
+#[tokio::test]
+async fn test_utf8_ilike_suffix() {
+    Utf8Test::new(|value| col("a").ilike(lit(format!("{value}%"))))
+        .run()
+        .await;
+}
+
 /// Fuzz testing for UTF8 predicate pruning
 /// The basic idea is that query results should always be the same with or without stats/pruning
 /// If we get this right we at least guarantee that there are no incorrect results
