@@ -1900,6 +1900,16 @@ fn build_ilike_match(
     if !decoded_prefix.is_ascii() {
         return None;
     }
+    // arrow folds ILIKE with full Unicode case folding for non-ASCII column
+    // data, where U+212A folds to 'k' and U+017F to 's'. Both encode to bytes
+    // outside the ASCII range, so the synthesized byte range can wrongly prune
+    // a matching value: bail out if the prefix contains k/K/s/S.
+    if decoded_prefix
+        .bytes()
+        .any(|b| matches!(b, b'k' | b'K' | b's' | b'S'))
+    {
+        return None;
+    }
 
     let lower_bound = string_literal_as(decoded_prefix.to_ascii_uppercase(), target_type);
     let upper_prefix = decoded_prefix.to_ascii_lowercase();
