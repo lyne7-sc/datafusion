@@ -138,6 +138,31 @@ SELECT '12345'::VARCHAR(2);
 ----
 12345
 
+# String functions should reject nested inputs rather than implicitly stringifying them.
+# Scalar values can still be coerced to strings, but callers must use an explicit
+# cast if they really want to stringify an array/struct/map value.
+
+query error Failed to coerce arguments.*reverse
+SELECT reverse([1, 2, 3]);
+
+query error requires String.*Struct
+SELECT lower(struct(1 AS a));
+
+query error requires String.*List
+SELECT contains([1, 2, 3], '2');
+
+query error concat does not support nested type
+SELECT concat([1, 2, 3]);
+
+query error concat does not support nested type
+SELECT concat('prefix-', [1, 2, 3]);
+
+query error concat does not support nested type
+SELECT concat_ws(',', 'prefix', [1, 2, 3]);
+
+query error concat does not support nested type
+SELECT concat_ws(',', struct(1 AS a), 'suffix');
+
 # Lengths can not be used when the config setting is disabled
 
 statement ok

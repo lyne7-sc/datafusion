@@ -1054,6 +1054,13 @@ fn maybe_data_types_without_coercion(
         if current_type == valid_type {
             new_type.push(current_type.clone())
         } else if can_cast_types(current_type, valid_type) {
+            // Arrow supports formatting nested arrays as strings, but DataFusion
+            // should not inject that cast implicitly for string function inputs.
+            if matches!(valid_type, DataType::Utf8 | DataType::LargeUtf8)
+                && current_type.is_nested()
+            {
+                return None;
+            }
             // validate the valid type is castable from the current type
             new_type.push(valid_type.clone())
         } else {
@@ -1148,8 +1155,11 @@ fn coerced_from<'a>(
         (Interval(_), Null | Utf8 | LargeUtf8) => Some(type_into.clone()),
         // We can go into a Utf8View from a Utf8 or LargeUtf8
         (Utf8View, Utf8 | LargeUtf8 | Null) => Some(type_into.clone()),
-        // Any type can be coerced into strings
-        (Utf8 | LargeUtf8, _) => Some(type_into.clone()),
+        // Non-nested types can be coerced into strings. Nested types have
+        // function-specific semantics and should not be stringified implicitly.
+        (Utf8 | LargeUtf8, data_type) if !data_type.is_nested() => {
+            Some(type_into.clone())
+        }
         // We can go into a BinaryView from a Binary or LargeBinary
         (BinaryView, Binary | LargeBinary | Null) => Some(type_into.clone()),
         (Null, _) if can_cast_types(type_from, type_into) => Some(type_into.clone()),

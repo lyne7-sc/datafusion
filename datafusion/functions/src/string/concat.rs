@@ -279,6 +279,12 @@ pub(crate) fn deduce_return_type(arg_types: &[DataType]) -> DataType {
 
 /// Coerce all arguments to the widest type within the binary / string family
 pub(crate) fn coerce_arg_types(arg_types: &[DataType]) -> Result<Vec<DataType>> {
+    if let Some(arg_type) = arg_types.iter().find(|dt| dt.is_nested()) {
+        return plan_err!(
+            "concat does not support nested type {arg_type}. Use an explicit CAST to stringify nested values."
+        );
+    }
+
     let has_binary = arg_types.iter().any(|dt| dt.is_binary());
     let has_string = arg_types.iter().any(|dt| dt.is_string());
     if has_binary && has_string {
