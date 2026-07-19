@@ -18,6 +18,7 @@
 //! Regex expressions
 
 use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, GenericStringArray};
+use arrow::buffer::NullBuffer;
 use arrow::compute::kernels::regexp;
 use arrow::datatypes::DataType;
 use arrow::datatypes::DataType::{LargeUtf8, Utf8, Utf8View};
@@ -122,6 +123,15 @@ impl ScalarUDFImpl for RegexpLikeFunc {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args
+            .args
+            .iter()
+            .any(|arg| matches!(arg, ColumnarValue::Scalar(value) if value.is_null()))
+        {
+            return Ok(ColumnarValue::Scalar(ScalarValue::try_new_null(
+                args.return_type(),
+            )?));
+        }
         let args = &args.args;
         match args.as_slice() {
             [ColumnarValue::Scalar(value), ColumnarValue::Scalar(pattern)] => {
@@ -319,7 +329,10 @@ pub fn regexp_like(args: &[ArrayRef]) -> Result<ArrayRef> {
                 return plan_err!("regexp_like() does not support the \"global\" option");
             }
 
-            handle_regexp_like(&args[0], &args[1], Some(flags))
+            let result = handle_regexp_like(&args[0], &args[1], Some(flags))?;
+            let result = result.as_boolean();
+            let nulls = NullBuffer::union(result.nulls(), flags.nulls());
+            Ok(Arc::new(BooleanArray::new(result.values().clone(), nulls)))
         }
         other => exec_err!(
             "`regexp_like` was called with {other} arguments. It requires at least 2 and at most 3."

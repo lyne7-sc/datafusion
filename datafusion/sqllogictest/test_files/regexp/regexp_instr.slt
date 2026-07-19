@@ -162,6 +162,15 @@ SELECT regexp_instr('a', NULL);
 ----
 NULL
 
+query IIII
+SELECT
+  regexp_instr('abc', 'a', NULL),
+  regexp_instr('abc', 'a', 1, NULL),
+  regexp_instr('abc', 'a', 1, 1, NULL),
+  regexp_instr('abc', 'a', 1, 1, 'i', NULL);
+----
+NULL NULL NULL NULL
+
 query I
 SELECT regexp_instr('😀abcdef', 'abc');
 ----

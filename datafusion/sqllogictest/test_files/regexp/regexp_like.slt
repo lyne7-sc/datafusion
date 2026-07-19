@@ -25,14 +25,14 @@ NULL
 true
 true
 true
-false
-false
-false
-true
-true
-true
-true
-true
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
 
 query B
 SELECT str ~ NULL FROM regexp_test_data;
@@ -141,6 +141,18 @@ query B
 SELECT regexp_like(null, '.*-(\d)');
 ----
 NULL
+
+query B
+SELECT regexp_like('aaa-0', '.*-(\d)', NULL);
+----
+NULL
+
+query B
+SELECT regexp_like(value, 'a', flags)
+FROM (VALUES ('a', CAST(NULL AS VARCHAR)), ('A', 'i')) AS t(value, flags);
+----
+NULL
+true
 
 query error Error during planning: regexp_like\(\) does not support the "global" option
 SELECT regexp_like('bb-1', '.*-(\d)', 'g');

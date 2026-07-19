@@ -17,6 +17,7 @@
 
 use crate::regex::{compile_and_cache_regex, compile_regex};
 use arrow::array::{Array, ArrayRef, AsArray, Datum, Int64Array, StringArrayType};
+use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Int64Type};
 use arrow::datatypes::{
     DataType::Int64, DataType::LargeUtf8, DataType::Utf8, DataType::Utf8View,
@@ -154,13 +155,17 @@ pub fn regexp_count_func(args: &[ArrayRef]) -> Result<ArrayRef> {
         }
     }
 
-    regexp_count(
+    let result = regexp_count(
         values,
         &args[1],
         if args_len > 2 { Some(&args[2]) } else { None },
         if args_len > 3 { Some(&args[3]) } else { None },
-    )
-    .map_err(|e| e.into())
+    )?;
+    let result = result.as_primitive::<Int64Type>();
+    let nulls = NullBuffer::union_many(
+        std::iter::once(result.nulls()).chain(args.iter().map(|arg| arg.nulls())),
+    );
+    Ok(Arc::new(Int64Array::new(result.values().clone(), nulls)))
 }
 
 /// `arrow-rs` style implementation of `regexp_count` function.
@@ -279,7 +284,11 @@ where
     let (start_array, start_scalar, is_start_scalar) =
         if let Some(start_array) = start_array {
             if is_start_scalar || start_array.len() == 1 {
-                (None, Some(start_array.value(0)), true)
+                (
+                    None,
+                    (!start_array.is_null(0)).then(|| start_array.value(0)),
+                    true,
+                )
             } else {
                 (Some(start_array), None, false)
             }
@@ -290,7 +299,11 @@ where
     let (flags_array, flags_scalar, is_flags_scalar) =
         if let Some(flags_array) = flags_array {
             if is_flags_scalar || flags_array.len() == 1 {
-                (None, Some(flags_array.value(0)), true)
+                (
+                    None,
+                    (!flags_array.is_null(0)).then(|| flags_array.value(0)),
+                    true,
+                )
             } else {
                 (Some(flags_array), None, false)
             }
@@ -414,7 +427,7 @@ where
                     .zip(regex_array.iter())
                     .map(|(value, regex)| {
                         let regex = match regex {
-                            None => return Ok(0),
+                            None => return Ok(Some(0)),
                             Some(regex) => regex,
                         };
 
@@ -450,7 +463,7 @@ where
                 izip!(values.iter(), regex_array.iter(), flags_array.iter())
                     .map(|(value, regex, flags)| {
                         let regex = match regex {
-                            None => return Ok(0),
+                            None => return Ok(Some(0)),
                             Some(regex) => regex,
                         };
 
@@ -484,7 +497,7 @@ where
                 izip!(values.iter(), regex_array.iter(), start_array.iter())
                     .map(|(value, regex, start)| {
                         let regex = match regex {
-                            None => return Ok(0),
+                            None => return Ok(Some(0)),
                             Some(regex) => regex,
                         };
 
@@ -534,7 +547,7 @@ where
                 )
                 .map(|(value, regex, start, flags)| {
                     let regex = match regex {
-                        None => return Ok(0),
+                        None => return Ok(Some(0)),
                         Some(regex) => regex,
                     };
 
@@ -552,9 +565,9 @@ fn count_matches(
     value: Option<&str>,
     pattern: &Regex,
     start: Option<i64>,
-) -> Result<i64, ArrowError> {
+) -> Result<Option<i64>, ArrowError> {
     let value = match value {
-        None => return Ok(0),
+        None => return Ok(Some(0)),
         Some(value) => value,
     };
 
@@ -569,7 +582,7 @@ fn count_matches(
         let start_index = (start as usize).saturating_sub(1);
 
         if start_index > char_len {
-            return Ok(0);
+            return Ok(Some(0));
         }
 
         // Find the byte offset for the start position (1-based character index)
@@ -586,10 +599,9 @@ fn count_matches(
         // Use string slicing instead of collecting chars into a new String
         let find_slice = &value[byte_offset..];
         let count = pattern.find_iter(find_slice).count();
-        Ok(count as i64)
+        Ok(Some(count as i64))
     } else {
-        let count = pattern.find_iter(value).count();
-        Ok(count as i64)
+        Ok(None)
     }
 }
 

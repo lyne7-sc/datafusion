@@ -301,6 +301,14 @@ where
             result.append_null();
             continue;
         }
+        if start_array.is_some_and(|array| array.is_null(i))
+            || nth_array.is_some_and(|array| array.is_null(i))
+            || flags_array.is_some_and(|array| array.is_null(i))
+            || subexp_array.is_some_and(|array| array.is_null(i))
+        {
+            result.append_null();
+            continue;
+        }
         let regex = regex_array.value(i);
         if regex.is_empty() {
             result.append_value(0);
@@ -323,8 +331,7 @@ where
         };
         let pattern = regex_cache.get_or_compile(regex, flags)?;
 
-        // The defaults apply when the optional argument was not supplied at
-        // all. A supplied but null slot reads through as its raw buffer value.
+        // Defaults apply only when the optional argument was not supplied.
         let start = start_array.map_or(1, |array| array.value(i));
         let nth = nth_array.map_or(1, |array| array.value(i));
         let subexp = subexp_array.map_or(0, |array| array.value(i));

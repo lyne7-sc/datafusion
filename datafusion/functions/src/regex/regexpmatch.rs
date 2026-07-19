@@ -16,7 +16,8 @@
 // under the License.
 
 //! Regex expressions
-use arrow::array::{Array, ArrayRef, AsArray, Datum};
+use arrow::array::{Array, ArrayRef, AsArray, Datum, ListArray};
+use arrow::buffer::NullBuffer;
 use arrow::compute::kernels::regexp;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
@@ -115,6 +116,15 @@ impl ScalarUDFImpl for RegexpMatchFunc {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args
+            .args
+            .iter()
+            .any(|arg| matches!(arg, ColumnarValue::Scalar(value) if value.is_null()))
+        {
+            return Ok(ColumnarValue::Scalar(ScalarValue::try_new_null(
+                args.return_type(),
+            )?));
+        }
         let args = &args.args;
 
         // A literal pattern is the common case, and handing it to the kernel as
@@ -242,8 +252,19 @@ pub fn regexp_match(args: &[ArrayRef]) -> Result<ArrayRef> {
                 }
             }
 
-            regexp::regexp_match(&args[0], &args[1], Some(&args[2]))
-                .map_err(|e| arrow_datafusion_err!(e))
+            let result = regexp::regexp_match(&args[0], &args[1], Some(&args[2]))
+                .map_err(|e| arrow_datafusion_err!(e))?;
+            let result = result.as_list::<i32>();
+            let DataType::List(field) = result.data_type() else {
+                unreachable!("regexp_match always returns a ListArray")
+            };
+            let nulls = NullBuffer::union(result.nulls(), args[2].nulls());
+            Ok(Arc::new(ListArray::new(
+                Arc::clone(field),
+                result.offsets().clone(),
+                Arc::clone(result.values()),
+                nulls,
+            )))
         }
         other => exec_err!(
             "regexp_match was called with {other} arguments. It requires at least 2 and at most 3."

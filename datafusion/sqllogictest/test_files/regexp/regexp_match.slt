@@ -28,11 +28,11 @@ NULL
 NULL
 NULL
 NULL
-[010]
-[Düsseldorf]
-[Москва]
-[Köln]
-[إسرائيل]
+NULL
+NULL
+NULL
+NULL
+NULL
 
 # test string view
 statement ok
@@ -49,11 +49,11 @@ NULL
 NULL
 NULL
 NULL
-[010]
-[Düsseldorf]
-[Москва]
-[Köln]
-[إسرائيل]
+NULL
+NULL
+NULL
+NULL
+NULL
 
 statement ok
 DROP TABLE t_stringview;
@@ -118,6 +118,18 @@ query ?
 SELECT regexp_match(null, '.*-(\d)');
 ----
 NULL
+
+query ?
+SELECT regexp_match('aaa-0', '.*-(\d)', NULL);
+----
+NULL
+
+query ?
+SELECT regexp_match(value, 'a', flags)
+FROM (VALUES ('a', CAST(NULL AS VARCHAR)), ('A', 'i')) AS t(value, flags);
+----
+NULL
+[A]
 
 query error Error during planning: regexp_match\(\) does not support the "global" option
 SELECT regexp_match('bb-1', '.*-(\d)', 'g');
