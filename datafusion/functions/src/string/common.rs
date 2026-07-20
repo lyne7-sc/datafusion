@@ -23,6 +23,9 @@ use crate::strings::{
     GenericStringArrayBuilder, STRING_VIEW_INIT_BLOCK_SIZE, STRING_VIEW_MAX_BLOCK_SIZE,
     StringViewArrayBuilder, StringWriter, append_view,
 };
+use crate::utils::{
+    transform_leaf_array_preserving_encoding, transform_leaf_scalar_preserving_encoding,
+};
 use arrow::array::{
     Array, ArrayRef, AsArray, GenericStringArray, NullBufferBuilder, OffsetSizeTrait,
     StringViewArray, new_null_array,
@@ -432,10 +435,14 @@ fn case_conversion(
 ) -> Result<ColumnarValue> {
     match &args[0] {
         ColumnarValue::Array(array) => Ok(ColumnarValue::Array(
-            case_conversion_columnar_array(array, lower, name)?,
+            transform_leaf_array_preserving_encoding(array, &|array| {
+                case_conversion_columnar_array(array, lower, name)
+            })?,
         )),
         ColumnarValue::Scalar(scalar) => Ok(ColumnarValue::Scalar(
-            case_conversion_scalar(scalar, lower, name)?,
+            transform_leaf_scalar_preserving_encoding(scalar, &|scalar| {
+                case_conversion_scalar(scalar, lower, name)
+            })?,
         )),
     }
 }
@@ -458,13 +465,6 @@ fn case_conversion_scalar(
             let result = a.as_ref().map(|x| unicode_case(x, lower));
             Ok(ScalarValue::Utf8View(result))
         }
-        ScalarValue::Dictionary(key_type, value) => {
-            let converted = case_conversion_scalar(value.as_ref(), lower, name)?;
-            Ok(ScalarValue::Dictionary(
-                key_type.clone(),
-                Box::new(converted),
-            ))
-        }
         other => exec_err!("Unsupported data type {other:?} for function {name}"),
     }
 }
@@ -478,7 +478,6 @@ fn case_conversion_columnar_array(
         DataType::Utf8 => case_conversion_array::<i32>(array, lower),
         DataType::LargeUtf8 => case_conversion_array::<i64>(array, lower),
         DataType::Utf8View => case_conversion_utf8view(array, lower),
-        DataType::Dictionary(_, _) => case_conversion_dictionary(array, lower, name),
         other => exec_err!("Unsupported data type {other:?} for function {name}"),
     }
 }
@@ -515,16 +514,6 @@ fn case_conversion_utf8view(array: &ArrayRef, lower: bool) -> Result<ArrayRef> {
     }
 
     Ok(Arc::new(builder.finish(nulls)?))
-}
-
-fn case_conversion_dictionary(
-    array: &ArrayRef,
-    lower: bool,
-    name: &str,
-) -> Result<ArrayRef> {
-    let dictionary = array.as_any_dictionary();
-    let converted = case_conversion_columnar_array(dictionary.values(), lower, name)?;
-    Ok(dictionary.with_values(converted))
 }
 
 fn case_conversion_array<O: OffsetSizeTrait>(

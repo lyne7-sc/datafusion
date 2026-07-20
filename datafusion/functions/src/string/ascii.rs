@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::utils::transform_leaf_type_preserving_encoding;
+use crate::utils::{
+    transform_leaf_array_preserving_encoding, transform_leaf_scalar_preserving_encoding,
+    transform_leaf_type_preserving_encoding,
+};
 use arrow::array::{ArrayRef, AsArray, Int32Array, StringArrayType};
 use arrow::datatypes::DataType;
 use arrow::error::ArrowError;
@@ -93,10 +96,10 @@ impl ScalarUDFImpl for AsciiFunc {
         let [arg] = take_function_args(self.name(), args.args)?;
 
         match arg {
-            ColumnarValue::Scalar(scalar) => {
-                Ok(ColumnarValue::Scalar(ascii_scalar(&scalar)?))
-            }
-            ColumnarValue::Array(array1) => Ok(ColumnarValue::Array(ascii(&[array])?)),
+            ColumnarValue::Scalar(scalar) => Ok(ColumnarValue::Scalar(
+                transform_leaf_scalar_preserving_encoding(&scalar, &ascii_scalar)?,
+            )),
+            ColumnarValue::Array(array) => Ok(ColumnarValue::Array(ascii(&[array])?)),
         }
     }
 
@@ -112,10 +115,6 @@ fn ascii_scalar(scalar: &ScalarValue) -> Result<ScalarValue> {
         | ScalarValue::Utf8View(value) => {
             Ok(ScalarValue::Int32(value.as_deref().map(first_char_code)))
         }
-        ScalarValue::Dictionary(key_type, value) => Ok(ScalarValue::Dictionary(
-            key_type.clone(),
-            Box::new(ascii_scalar(value)?),
-        )),
         _ => internal_err!(
             "Unexpected data type {:?} for function ascii",
             scalar.data_type()
@@ -176,23 +175,22 @@ where
 
 /// Returns the numeric code of the first character of the argument.
 pub fn ascii(args: &[ArrayRef]) -> Result<ArrayRef> {
-    match args[0].data_type() {
+    transform_leaf_array_preserving_encoding(&args[0], &ascii_array)
+}
+
+fn ascii_array(array: &ArrayRef) -> Result<ArrayRef> {
+    match array.data_type() {
         DataType::Utf8 => {
-            let string_array = args[0].as_string::<i32>();
+            let string_array = array.as_string::<i32>();
             Ok(calculate_ascii(&string_array)?)
         }
         DataType::LargeUtf8 => {
-            let string_array = args[0].as_string::<i64>();
+            let string_array = array.as_string::<i64>();
             Ok(calculate_ascii(&string_array)?)
         }
         DataType::Utf8View => {
-            let string_array = args[0].as_string_view();
+            let string_array = array.as_string_view();
             Ok(calculate_ascii(&string_array)?)
-        }
-        DataType::Dictionary(_, _) => {
-            let dictionary = args[0].as_any_dictionary();
-            let converted = ascii(&[dictionary.values().clone()])?;
-            Ok(dictionary.with_values(converted))
         }
         _ => internal_err!("Unsupported data type"),
     }

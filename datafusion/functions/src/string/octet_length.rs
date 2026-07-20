@@ -18,7 +18,10 @@
 use arrow::compute::kernels::length::length;
 use arrow::datatypes::DataType;
 
-use crate::utils::{transform_leaf_type_preserving_encoding, utf8_to_int_type};
+use crate::utils::{
+    transform_leaf_scalar_preserving_encoding, transform_leaf_type_preserving_encoding,
+    utf8_to_int_type,
+};
 use datafusion_common::types::logical_string;
 use datafusion_common::utils::take_function_args;
 use datafusion_common::{Result, ScalarValue};
@@ -89,7 +92,11 @@ impl ScalarUDFImpl for OctetLengthFunc {
 
         match array {
             ColumnarValue::Array(v) => Ok(ColumnarValue::Array(length(v.as_ref())?)),
-            ColumnarValue::Scalar(v) => Ok(ColumnarValue::Scalar(octet_length_scalar(v))),
+            ColumnarValue::Scalar(v) => Ok(ColumnarValue::Scalar(
+                transform_leaf_scalar_preserving_encoding(v, &|value| {
+                    Ok(octet_length_scalar(value))
+                })?,
+            )),
         }
     }
 
@@ -107,10 +114,6 @@ fn octet_length_scalar(value: &ScalarValue) -> ScalarValue {
         ScalarValue::Utf8View(v) => {
             ScalarValue::Int32(v.as_ref().map(|x| x.len() as i32))
         }
-        ScalarValue::Dictionary(key_type, value) => ScalarValue::Dictionary(
-            key_type.clone(),
-            Box::new(octet_length_scalar(value)),
-        ),
         _ => unreachable!("OctetLengthFunc"),
     }
 }

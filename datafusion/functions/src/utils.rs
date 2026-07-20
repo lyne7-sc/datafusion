@@ -96,6 +96,42 @@ where
     }
 }
 
+/// Transforms a scalar leaf value while preserving supported encoding containers.
+pub(crate) fn transform_leaf_scalar_preserving_encoding<F>(
+    value: &ScalarValue,
+    transform: &F,
+) -> Result<ScalarValue>
+where
+    F: Fn(&ScalarValue) -> Result<ScalarValue>,
+{
+    match value {
+        ScalarValue::Dictionary(key_type, value) => Ok(ScalarValue::Dictionary(
+            key_type.clone(),
+            Box::new(transform_leaf_scalar_preserving_encoding(value, transform)?),
+        )),
+        _ => transform(value),
+    }
+}
+
+/// Transforms array leaf values while preserving supported encoding containers.
+pub(crate) fn transform_leaf_array_preserving_encoding<F>(
+    array: &ArrayRef,
+    transform: &F,
+) -> Result<ArrayRef>
+where
+    F: Fn(&ArrayRef) -> Result<ArrayRef>,
+{
+    match array.data_type() {
+        DataType::Dictionary(_, _) => {
+            let dictionary = array.as_any_dictionary();
+            let values =
+                transform_leaf_array_preserving_encoding(dictionary.values(), transform)?;
+            Ok(dictionary.with_values(values))
+        }
+        _ => transform(array),
+    }
+}
+
 /// Creates a scalar function implementation for the given function.
 /// * `inner` - the function to be executed
 /// * `hints` - hints to be used when expanding scalars to arrays
