@@ -64,10 +64,6 @@ impl TraverseState {
         self.limit = limit;
         self.lookahead = 0;
     }
-
-    pub fn max_lookahead(&mut self, new_val: usize) {
-        self.lookahead = self.lookahead.max(new_val);
-    }
 }
 
 impl PhysicalOptimizerRule for LimitPushPastWindows {
@@ -153,6 +149,7 @@ impl PhysicalOptimizerRule for LimitPushPastWindows {
 
 fn grow_limit(window: &BoundedWindowAggExec, ctx: &mut TraverseState) -> bool {
     let mut max_rel = 0;
+    let mut max_frame = 0;
     for expr in window.window_expr().iter() {
         // grow based on function requirements
         match get_limit_effect(expr) {
@@ -173,11 +170,19 @@ fn grow_limit(window: &BoundedWindowAggExec, ctx: &mut TraverseState) -> bool {
         let Some(end_bound) = bound_to_usize(&frame.end_bound) else {
             return false; // can't optimize unbounded window expressions
         };
-        ctx.max_lookahead(end_bound);
+        max_frame = max_frame.max(end_bound);
     }
 
-    // finish grow
-    ctx.max_lookahead(ctx.lookahead + max_rel);
+    // Each window operator needs enough input for both its largest frame and
+    // its largest relative function requirement. Consecutive window operators
+    // consume each other's output, so their lookaheads must accumulate.
+    let Some(window_lookahead) = max_frame.checked_add(max_rel) else {
+        return false;
+    };
+    let Some(lookahead) = ctx.lookahead.checked_add(window_lookahead) else {
+        return false;
+    };
+    ctx.lookahead = lookahead;
     true
 }
 
@@ -194,16 +199,24 @@ fn apply_limit(
         ctx.lookahead = 0;
         return Some(Transformed::no(Arc::clone(node)));
     };
+    let Some(fetch) = fetch.checked_add(ctx.lookahead) else {
+        ctx.lookahead = 0;
+        return Some(Transformed::no(Arc::clone(node)));
+    };
     let fetch = match node.fetch() {
-        None => fetch + ctx.lookahead,
-        Some(existing) => cmp::min(existing, fetch + ctx.lookahead),
+        None => fetch,
+        Some(existing) => cmp::min(existing, fetch),
     };
     Some(Transformed::complete(node.with_fetch(Some(fetch)).unwrap()))
 }
 
 fn get_limit(node: &Arc<dyn ExecutionPlan>, ctx: &mut TraverseState) -> bool {
     if let Some(limit) = node.downcast_ref::<GlobalLimitExec>() {
-        ctx.reset_limit(limit.fetch().map(|fetch| fetch + limit.skip()));
+        ctx.reset_limit(
+            limit
+                .fetch()
+                .and_then(|fetch| fetch.checked_add(limit.skip())),
+        );
         return true;
     }
     // In distributed execution, GlobalLimitExec becomes LocalLimitExec
@@ -255,7 +268,7 @@ fn bound_to_usize(bound: &WindowFrameBound) -> Option<usize> {
         WindowFrameBound::Preceding(_) => Some(0),
         WindowFrameBound::CurrentRow => Some(0),
         WindowFrameBound::Following(ScalarValue::UInt64(Some(scalar))) => {
-            Some(*scalar as usize)
+            usize::try_from(*scalar).ok()
         }
         _ => None,
     }

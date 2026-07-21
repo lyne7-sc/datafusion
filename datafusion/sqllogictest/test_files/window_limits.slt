@@ -764,3 +764,76 @@ physical_plan
 03)----BoundedWindowAggExec: wdw=[lead(employees.salary,Int64(2)) ORDER BY [employees.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "lead(employees.salary,Int64(2)) ORDER BY [employees.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": nullable UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
 04)------SortExec: TopK(fetch=5), expr=[empno@0 ASC NULLS LAST], preserve_partitioning=[false]
 05)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/testing/data/csv/aggregate_test_100_with_dates.csv]]}, projection=[empno, salary], file_type=csv, has_header=true
+
+# Lookahead should be accumulated across consecutive window operators
+statement ok
+set datafusion.optimizer.enable_window_limits = false;
+
+query IIIII
+WITH first_window AS (
+  SELECT
+    empno,
+    SUM(salary) OVER (
+      ORDER BY empno ROWS BETWEEN CURRENT ROW AND 10 FOLLOWING
+    ) AS inner_sum,
+    LEAD(salary, 1) OVER (
+      ORDER BY empno ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS inner_lead
+  FROM employees
+), second_window AS (
+  SELECT
+    empno,
+    inner_sum,
+    inner_lead,
+    SUM(inner_sum) OVER (
+      ORDER BY empno ROWS BETWEEN CURRENT ROW AND 12 FOLLOWING
+    ) AS outer_sum,
+    LEAD(inner_lead, 1) OVER (
+      ORDER BY empno ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS outer_lead
+  FROM first_window
+)
+SELECT empno, inner_sum, inner_lead, outer_sum, outer_lead
+FROM second_window
+ORDER BY empno
+LIMIT 3;
+----
+102 22805759466 28774375 258339011754 1865307672
+299 20284411587 1865307672 260124997141 557517119
+363 20481150297 557517119 262522654919 4061635107
+
+statement ok
+set datafusion.optimizer.enable_window_limits = true;
+
+query IIIII
+WITH first_window AS (
+  SELECT
+    empno,
+    SUM(salary) OVER (
+      ORDER BY empno ROWS BETWEEN CURRENT ROW AND 10 FOLLOWING
+    ) AS inner_sum,
+    LEAD(salary, 1) OVER (
+      ORDER BY empno ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS inner_lead
+  FROM employees
+), second_window AS (
+  SELECT
+    empno,
+    inner_sum,
+    inner_lead,
+    SUM(inner_sum) OVER (
+      ORDER BY empno ROWS BETWEEN CURRENT ROW AND 12 FOLLOWING
+    ) AS outer_sum,
+    LEAD(inner_lead, 1) OVER (
+      ORDER BY empno ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS outer_lead
+  FROM first_window
+)
+SELECT empno, inner_sum, inner_lead, outer_sum, outer_lead
+FROM second_window
+ORDER BY empno
+LIMIT 3;
+----
+102 22805759466 28774375 258339011754 1865307672
+299 20284411587 1865307672 260124997141 557517119
+363 20481150297 557517119 262522654919 4061635107
