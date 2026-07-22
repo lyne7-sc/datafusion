@@ -765,43 +765,7 @@ physical_plan
 04)------SortExec: TopK(fetch=5), expr=[empno@0 ASC NULLS LAST], preserve_partitioning=[false]
 05)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/testing/data/csv/aggregate_test_100_with_dates.csv]]}, projection=[empno, salary], file_type=csv, has_header=true
 
-# Lookahead should be accumulated across consecutive window operators
-statement ok
-set datafusion.optimizer.enable_window_limits = false;
-
-query IIIII
-WITH first_window AS (
-  SELECT
-    empno,
-    SUM(salary) OVER (
-      ORDER BY empno ROWS BETWEEN CURRENT ROW AND 10 FOLLOWING
-    ) AS inner_sum,
-    LEAD(salary, 1) OVER (
-      ORDER BY empno ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS inner_lead
-  FROM employees
-), second_window AS (
-  SELECT
-    empno,
-    inner_sum,
-    inner_lead,
-    SUM(inner_sum) OVER (
-      ORDER BY empno ROWS BETWEEN CURRENT ROW AND 12 FOLLOWING
-    ) AS outer_sum,
-    LEAD(inner_lead, 1) OVER (
-      ORDER BY empno ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS outer_lead
-  FROM first_window
-)
-SELECT empno, inner_sum, inner_lead, outer_sum, outer_lead
-FROM second_window
-ORDER BY empno
-LIMIT 3;
-----
-102 22805759466 28774375 258339011754 1865307672
-299 20284411587 1865307672 260124997141 557517119
-363 20481150297 557517119 262522654919 4061635107
-
+# Lookahead should be accumulated across dependent window operators
 statement ok
 set datafusion.optimizer.enable_window_limits = true;
 
@@ -837,3 +801,54 @@ LIMIT 3;
 102 22805759466 28774375 258339011754 1865307672
 299 20284411587 1865307672 260124997141 557517119
 363 20481150297 557517119 262522654919 4061635107
+
+# Accumulate lookahead only across dependent windows through a projection
+query TT
+EXPLAIN WITH bottom_window AS (
+  SELECT
+    empno,
+    salary,
+    LEAD(salary, 1) OVER (
+      ORDER BY empno ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS bottom_value
+  FROM employees
+), middle_window AS (
+  SELECT
+    empno,
+    bottom_value,
+    LEAD(salary, 1) OVER (
+      ORDER BY empno ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS middle_value
+  FROM bottom_window
+)
+SELECT
+  empno,
+  bottom_value,
+  middle_value,
+  LEAD(bottom_value, 1) OVER (
+    ORDER BY empno ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS top_value
+FROM middle_window
+LIMIT 3;
+----
+logical_plan
+01)Projection: middle_window.empno, middle_window.bottom_value, middle_window.middle_value, lead(middle_window.bottom_value,Int64(1)) ORDER BY [middle_window.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS top_value
+02)--Limit: skip=0, fetch=3
+03)----WindowAggr: windowExpr=[[lead(middle_window.bottom_value, Int64(1)) ORDER BY [middle_window.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+04)------SubqueryAlias: middle_window
+05)--------Projection: bottom_window.empno, bottom_window.bottom_value, lead(bottom_window.salary,Int64(1)) ORDER BY [bottom_window.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS middle_value
+06)----------WindowAggr: windowExpr=[[lead(bottom_window.salary, Int64(1)) ORDER BY [bottom_window.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+07)------------SubqueryAlias: bottom_window
+08)--------------Projection: employees.empno, employees.salary, lead(employees.salary,Int64(1)) ORDER BY [employees.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS bottom_value
+09)----------------WindowAggr: windowExpr=[[lead(employees.salary, Int64(1)) ORDER BY [employees.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+10)------------------TableScan: employees projection=[empno, salary]
+physical_plan
+01)ProjectionExec: expr=[empno@0 as empno, bottom_value@1 as bottom_value, middle_value@2 as middle_value, lead(middle_window.bottom_value,Int64(1)) ORDER BY [middle_window.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@3 as top_value]
+02)--GlobalLimitExec: skip=0, fetch=3
+03)----BoundedWindowAggExec: wdw=[lead(middle_window.bottom_value,Int64(1)) ORDER BY [middle_window.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "lead(middle_window.bottom_value,Int64(1)) ORDER BY [middle_window.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": nullable UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+04)------ProjectionExec: expr=[empno@0 as empno, bottom_value@2 as bottom_value, lead(bottom_window.salary,Int64(1)) ORDER BY [bottom_window.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@3 as middle_value]
+05)--------BoundedWindowAggExec: wdw=[lead(bottom_window.salary,Int64(1)) ORDER BY [bottom_window.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "lead(bottom_window.salary,Int64(1)) ORDER BY [bottom_window.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": nullable UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+06)----------ProjectionExec: expr=[empno@0 as empno, salary@1 as salary, lead(employees.salary,Int64(1)) ORDER BY [employees.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW@2 as bottom_value]
+07)------------BoundedWindowAggExec: wdw=[lead(employees.salary,Int64(1)) ORDER BY [employees.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW: Field { "lead(employees.salary,Int64(1)) ORDER BY [employees.empno ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW": nullable UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+08)--------------SortExec: TopK(fetch=5), expr=[empno@0 ASC NULLS LAST], preserve_partitioning=[false]
+09)----------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/testing/data/csv/aggregate_test_100_with_dates.csv]]}, projection=[empno, salary], file_type=csv, has_header=true

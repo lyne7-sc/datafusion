@@ -20,18 +20,21 @@ use datafusion_common::ScalarValue;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_expr::{LimitEffect, WindowFrameBound, WindowFrameUnits};
+use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::window::{
     PlainAggregateWindowExpr, SlidingAggregateWindowExpr, StandardWindowExpr,
     StandardWindowFunctionExpr, WindowExpr,
 };
 use datafusion_physical_plan::execution_plan::CardinalityEffect;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowUDFExpr};
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::cmp;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// This rule inspects [`ExecutionPlan`]'s attempting to find fetch limits that were not pushed
@@ -53,16 +56,29 @@ enum Phase {
     Apply,
 }
 
-#[derive(Default)]
 struct TraverseState {
     pub limit: Option<usize>,
     pub lookahead: usize,
+    /// Columns required by windows above the current node. `None` means their
+    /// lineage could not be determined safely.
+    required_columns: Option<HashSet<usize>>,
+}
+
+impl Default for TraverseState {
+    fn default() -> Self {
+        Self {
+            limit: None,
+            lookahead: 0,
+            required_columns: Some(HashSet::new()),
+        }
+    }
 }
 
 impl TraverseState {
     pub fn reset_limit(&mut self, limit: Option<usize>) {
         self.limit = limit;
         self.lookahead = 0;
+        self.required_columns = Some(HashSet::new());
     }
 }
 
@@ -84,8 +100,7 @@ impl PhysicalOptimizerRule for LimitPushPastWindows {
              -> datafusion_common::Result<
                 Transformed<Arc<dyn ExecutionPlan>>,
             > {
-                ctx.limit = None;
-                ctx.lookahead = 0;
+                ctx.reset_limit(None);
                 Ok(Transformed::no(node))
             };
 
@@ -133,6 +148,10 @@ impl PhysicalOptimizerRule for LimitPushPastWindows {
                 CardinalityEffect::GreaterEqual => {}
             }
 
+            ctx.required_columns = ctx
+                .required_columns
+                .take()
+                .and_then(|columns| map_required_columns_to_input(&node, columns));
             Ok(Transformed::no(node))
         })?;
         Ok(result.data)
@@ -174,15 +193,37 @@ fn grow_limit(window: &BoundedWindowAggExec, ctx: &mut TraverseState) -> bool {
     }
 
     // Each window operator needs enough input for both its largest frame and
-    // its largest relative function requirement. Consecutive window operators
-    // consume each other's output, so their lookaheads must accumulate.
+    // its largest relative function requirement.
     let Some(window_lookahead) = max_frame.checked_add(max_rel) else {
         return false;
     };
-    let Some(lookahead) = ctx.lookahead.checked_add(window_lookahead) else {
-        return false;
+
+    let input_len = window.input().schema().fields().len();
+    let accumulate = match (
+        &mut ctx.required_columns,
+        collect_window_required_columns(window, input_len),
+    ) {
+        (Some(previous), Some(current)) => {
+            let accumulate = previous.iter().any(|index| *index >= input_len);
+            previous.retain(|index| *index < input_len);
+            previous.extend(current);
+            accumulate
+        }
+        (required_columns, _) => {
+            // Unknown lineage requires conservative accumulation.
+            *required_columns = None;
+            true
+        }
     };
-    ctx.lookahead = lookahead;
+    ctx.lookahead = if accumulate {
+        let Some(lookahead) = ctx.lookahead.checked_add(window_lookahead) else {
+            return false;
+        };
+        lookahead
+    } else {
+        ctx.lookahead.max(window_lookahead)
+    };
+
     true
 }
 
@@ -195,12 +236,11 @@ fn apply_limit(
     }
     let latest = ctx.limit.take();
     let Some(fetch) = latest else {
-        ctx.limit = None;
-        ctx.lookahead = 0;
+        ctx.reset_limit(None);
         return Some(Transformed::no(Arc::clone(node)));
     };
     let Some(fetch) = fetch.checked_add(ctx.lookahead) else {
-        ctx.lookahead = 0;
+        ctx.reset_limit(None);
         return Some(Transformed::no(Arc::clone(node)));
     };
     let fetch = match node.fetch() {
@@ -230,6 +270,56 @@ fn get_limit(node: &Arc<dyn ExecutionPlan>, ctx: &mut TraverseState) -> bool {
         return true;
     }
     false
+}
+
+fn collect_window_required_columns(
+    window: &BoundedWindowAggExec,
+    input_len: usize,
+) -> Option<HashSet<usize>> {
+    let required_columns = window
+        .window_expr()
+        .iter()
+        .flat_map(|expr| {
+            expr.expressions()
+                .into_iter()
+                .chain(expr.partition_by().iter().cloned())
+                .chain(expr.order_by().iter().map(|sort| Arc::clone(&sort.expr)))
+        })
+        .flat_map(|expr| collect_columns(&expr))
+        .map(|column| column.index())
+        .collect::<HashSet<_>>();
+
+    (!required_columns.iter().any(|index| *index >= input_len))
+        .then_some(required_columns)
+}
+
+fn map_required_columns_to_input(
+    node: &Arc<dyn ExecutionPlan>,
+    columns: HashSet<usize>,
+) -> Option<HashSet<usize>> {
+    if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
+        let mut input_columns = HashSet::new();
+        for index in columns {
+            let projection_expr = projection.expr().get(index)?;
+            input_columns.extend(
+                collect_columns(&projection_expr.expr)
+                    .into_iter()
+                    .map(|column| column.index()),
+            );
+        }
+        return Some(input_columns);
+    }
+
+    let children = node.children();
+    let Some(input) = children.first() else {
+        return Some(columns);
+    };
+
+    (node.schema() == input.schema()
+        && columns
+            .iter()
+            .all(|index| *index < input.schema().fields().len()))
+    .then_some(columns)
 }
 
 /// Examines the `WindowExpr` and decides:
@@ -279,6 +369,7 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_expr::WindowFrame;
+    use datafusion_functions_window::lead_lag::lead_udwf;
     use datafusion_functions_window::row_number::row_number_udwf;
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
@@ -347,6 +438,72 @@ mod tests {
         Ok(limit)
     }
 
+    fn lead_window(
+        input: Arc<dyn ExecutionPlan>,
+        argument: &str,
+        name: &str,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let schema = input.schema();
+        let ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(col("a", &schema)?).asc(),
+        ])
+        .unwrap();
+        let window_expr = Arc::new(StandardWindowExpr::new(
+            create_udwf_window_expr(
+                &lead_udwf(),
+                &[col(argument, &schema)?],
+                &schema,
+                name.to_string(),
+                false,
+            )?,
+            &[],
+            ordering.as_ref(),
+            Arc::new(WindowFrame::new_bounds(
+                WindowFrameUnits::Rows,
+                WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
+                WindowFrameBound::CurrentRow,
+            )),
+        ));
+
+        Ok(Arc::new(BoundedWindowAggExec::try_new(
+            vec![window_expr],
+            input,
+            InputOrderMode::Sorted,
+            true,
+        )?))
+    }
+
+    fn project_all(
+        input: Arc<dyn ExecutionPlan>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let schema = input.schema();
+        let expressions = schema
+            .fields()
+            .iter()
+            .map(|field| Ok((col(field.name(), &schema)?, field.name().to_string())))
+            .collect::<datafusion_common::Result<Vec<_>>>()?;
+        Ok(Arc::new(ProjectionExec::try_new(expressions, input)?))
+    }
+
+    fn build_dependent_window_plan() -> datafusion_common::Result<Arc<dyn ExecutionPlan>>
+    {
+        let schema = schema();
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(PlaceholderRowExec::new(Arc::clone(&schema)));
+        let ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(col("a", &schema)?).asc(),
+        ])
+        .unwrap();
+        let sort: Arc<dyn ExecutionPlan> =
+            Arc::new(SortExec::new(ordering, input).with_preserve_partitioning(true));
+
+        let bottom = lead_window(sort, "a", "bottom_value")?;
+        let middle = lead_window(project_all(bottom)?, "a", "middle_value")?;
+        let top = lead_window(project_all(middle)?, "bottom_value", "top_value")?;
+
+        Ok(Arc::new(LocalLimitExec::new(top, 3)))
+    }
+
     fn optimize(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let mut config = ConfigOptions::new();
         config.optimizer.enable_window_limits = true;
@@ -377,6 +534,22 @@ mod tests {
           BoundedWindowAggExec: wdw=[row_number: Field { "row_number": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
             SortExec: TopK(fetch=100), expr=[a@0 ASC], preserve_partitioning=[true]
               PlaceholderRowExec
+        "#);
+    }
+
+    #[test]
+    fn local_limit_accumulates_dependent_window_lookahead_through_projection() {
+        let plan = build_dependent_window_plan().unwrap();
+        let optimized = optimize(plan);
+        assert_snapshot!(plan_str(optimized.as_ref()), @r#"
+        LocalLimitExec: fetch=3
+          BoundedWindowAggExec: wdw=[top_value: Field { "top_value": nullable Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+            ProjectionExec: expr=[a@0 as a, bottom_value@1 as bottom_value, middle_value@2 as middle_value]
+              BoundedWindowAggExec: wdw=[middle_value: Field { "middle_value": nullable Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+                ProjectionExec: expr=[a@0 as a, bottom_value@1 as bottom_value]
+                  BoundedWindowAggExec: wdw=[bottom_value: Field { "bottom_value": nullable Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+                    SortExec: TopK(fetch=5), expr=[a@0 ASC], preserve_partitioning=[true]
+                      PlaceholderRowExec
         "#);
     }
 }
