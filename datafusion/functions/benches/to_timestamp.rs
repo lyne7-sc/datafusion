@@ -23,7 +23,7 @@ use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use criterion::{Criterion, criterion_group, criterion_main};
-use datafusion_common::config::ConfigOptions;
+use datafusion_common::{ScalarValue, config::ConfigOptions};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs};
 use datafusion_functions::datetime::to_timestamp;
 
@@ -191,6 +191,40 @@ fn criterion_benchmark(c: &mut Criterion) {
             ColumnarValue::Array(Arc::new(format1) as ArrayRef),
             ColumnarValue::Array(Arc::new(format2) as ArrayRef),
             ColumnarValue::Array(Arc::new(format3) as ArrayRef),
+        ];
+        let arg_fields = args
+            .iter()
+            .enumerate()
+            .map(|(idx, arg)| {
+                Field::new(format!("arg_{idx}"), arg.data_type(), true).into()
+            })
+            .collect::<Vec<_>>();
+
+        b.iter(|| {
+            black_box(
+                to_timestamp_udf
+                    .invoke_with_args(ScalarFunctionArgs {
+                        args: args.clone(),
+                        arg_fields: arg_fields.clone(),
+                        number_rows: batch_len,
+                        return_field: Arc::clone(&return_field),
+                        config_options: Arc::clone(&config_options),
+                    })
+                    .expect("to_timestamp should work on valid values"),
+            )
+        })
+    });
+
+    c.bench_function("to_timestamp_with_scalar_format_utf8", |b| {
+        let to_timestamp_udf = Arc::clone(&to_timestamp_udf);
+        let inputs = StringArray::from(vec!["1997-01-31T09:26:56.123-05:00"; 8192]);
+        let batch_len = inputs.len();
+
+        let args = vec![
+            ColumnarValue::Array(Arc::new(inputs) as ArrayRef),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                "%Y-%m-%dT%H:%M:%S%.f%:z".to_string(),
+            ))),
         ];
         let arg_fields = args
             .iter()

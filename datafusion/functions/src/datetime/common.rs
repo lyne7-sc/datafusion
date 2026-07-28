@@ -27,7 +27,7 @@ use arrow::compute::kernels::cast_utils::string_to_datetime;
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow_buffer::ArrowNativeType;
 use chrono::LocalResult::Single;
-use chrono::format::{Parsed, StrftimeItems, parse};
+use chrono::format::{Item, Parsed, StrftimeItems, parse};
 use chrono::{DateTime, TimeZone, Utc};
 use datafusion_common::cast::as_generic_string_array;
 use datafusion_common::{
@@ -40,6 +40,35 @@ use datafusion_expr::ColumnarValue;
 const ERR_NANOSECONDS_NOT_SUPPORTED: &str = "The dates that can be represented as nanoseconds have to be between 1677-09-21T00:12:44.0 and 2262-04-11T23:47:16.854775804";
 
 static UTC: LazyLock<Tz> = LazyLock::new(|| "UTC".parse().expect("UTC is always valid"));
+
+/// A timestamp format and its precompiled chrono items.
+pub(crate) struct CompiledTimestampFormat<'a> {
+    format: &'a str,
+    items: Vec<Item<'a>>,
+}
+
+impl<'a> CompiledTimestampFormat<'a> {
+    pub(crate) fn try_new(format: &'a str) -> Option<Self> {
+        if format.contains("%Z") {
+            None
+        } else {
+            Some(Self {
+                format,
+                items: StrftimeItems::new(format).collect(),
+            })
+        }
+    }
+
+    #[inline]
+    pub(crate) fn parse_nanos(&self, timezone: &Option<Tz>, s: &str) -> Result<i64> {
+        string_to_timestamp_nanos_formatted_with_timezone_impl(
+            timezone,
+            s,
+            self.format,
+            Some(&self.items),
+        )
+    }
+}
 
 /// Converts a string representation of a date‑time into a timestamp expressed in
 /// nanoseconds since the Unix epoch.
@@ -108,6 +137,15 @@ pub(crate) fn string_to_datetime_formatted<T: TimeZone>(
     s: &str,
     format: &str,
 ) -> Result<DateTime<T>, DataFusionError> {
+    string_to_datetime_formatted_impl(timezone, s, format, None)
+}
+
+fn string_to_datetime_formatted_impl<T: TimeZone>(
+    timezone: &T,
+    s: &str,
+    format: &str,
+    items: Option<&[Item<'_>]>,
+) -> Result<DateTime<T>, DataFusionError> {
     let err = |err_ctx: &str| {
         exec_datafusion_err!(
             "Error parsing timestamp from '{s}' using format '{format}': {err_ctx}"
@@ -149,8 +187,11 @@ pub(crate) fn string_to_datetime_formatted<T: TimeZone>(
     };
 
     let mut parsed = Parsed::new();
-    parse(&mut parsed, datetime_str, StrftimeItems::new(format))
-        .map_err(|e| err(&e.to_string()))?;
+    match items {
+        Some(items) => parse(&mut parsed, datetime_str, items.iter()),
+        None => parse(&mut parsed, datetime_str, StrftimeItems::new(format)),
+    }
+    .map_err(|e| err(&e.to_string()))?;
 
     let dt = match tz {
         Some(tz) => {
@@ -215,7 +256,22 @@ pub(crate) fn string_to_timestamp_nanos_formatted_with_timezone(
     s: &str,
     format: &str,
 ) -> Result<i64, DataFusionError> {
-    let dt = string_to_datetime_formatted(timezone.as_ref().unwrap_or(&UTC), s, format)?;
+    string_to_timestamp_nanos_formatted_with_timezone_impl(timezone, s, format, None)
+}
+
+#[inline]
+fn string_to_timestamp_nanos_formatted_with_timezone_impl(
+    timezone: &Option<Tz>,
+    s: &str,
+    format: &str,
+    items: Option<&[Item<'_>]>,
+) -> Result<i64, DataFusionError> {
+    let dt = string_to_datetime_formatted_impl(
+        timezone.as_ref().unwrap_or(&UTC),
+        s,
+        format,
+        items,
+    )?;
     let parsed = dt
         .timestamp_nanos_opt()
         .ok_or_else(|| exec_datafusion_err!("{ERR_NANOSECONDS_NOT_SUPPORTED}"))?;

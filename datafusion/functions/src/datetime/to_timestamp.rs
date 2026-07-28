@@ -810,15 +810,29 @@ fn to_timestamp_impl<T: ArrowTimestampType + ScalarType<i64>>(
             name,
             &Timestamp(T::UNIT, timezone.clone()),
         ),
-        n if n >= 2 => handle_multiple::<T, _, _>(
-            args,
-            move |s, format| {
-                string_to_timestamp_nanos_formatted_with_timezone(&tz, s, format)
-            },
-            |n| n / factor,
-            name,
-            &Timestamp(T::UNIT, timezone.clone()),
-        ),
+        n if n >= 2 => {
+            if let [ColumnarValue::Array(_), ColumnarValue::Scalar(format)] = args
+                && let Some(format) = format.try_as_str().flatten()
+                && let Some(format) = CompiledTimestampFormat::try_new(format)
+            {
+                handle::<T, _>(
+                    &args[..1],
+                    move |s| format.parse_nanos(&tz, s).map(|value| value / factor),
+                    name,
+                    &Timestamp(T::UNIT, timezone.clone()),
+                )
+            } else {
+                handle_multiple::<T, _, _>(
+                    args,
+                    move |s, format| {
+                        string_to_timestamp_nanos_formatted_with_timezone(&tz, s, format)
+                    },
+                    |n| n / factor,
+                    name,
+                    &Timestamp(T::UNIT, timezone.clone()),
+                )
+            }
+        }
         _ => exec_err!("Unsupported 0 argument count for function {name}"),
     }
 }

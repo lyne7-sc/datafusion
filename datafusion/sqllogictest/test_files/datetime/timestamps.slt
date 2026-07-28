@@ -2618,6 +2618,42 @@ SELECT arrow_typeof(to_timestamp(1, '%c', '%s')), arrow_typeof(to_timestamp(null
 ----
 Timestamp(ns) Timestamp(ns) Timestamp(ns)
 
+# array input with a scalar format
+query PPPPP rowsort
+SELECT to_timestamp(ts, '%+'),
+       to_timestamp_seconds(ts, '%+'),
+       to_timestamp_millis(ts, '%+'),
+       to_timestamp_micros(ts, '%+'),
+       to_timestamp_nanos(ts, '%+')
+FROM (VALUES ('2020-09-08T13:42:29.190855123Z'), (NULL)) AS t(ts);
+----
+2020-09-08T13:42:29.190855123 2020-09-08T13:42:29 2020-09-08T13:42:29.190 2020-09-08T13:42:29.190855 2020-09-08T13:42:29.190855123
+NULL NULL NULL NULL NULL
+
+# LargeUtf8 array input with a scalar format
+query P rowsort
+SELECT to_timestamp(arrow_cast(ts, 'LargeUtf8'), '%+')
+FROM (VALUES ('2020-09-08T13:42:29.190855123Z'), (NULL)) AS t(ts);
+----
+2020-09-08T13:42:29.190855123
+NULL
+
+# Utf8View array input with a scalar format
+query P rowsort
+SELECT to_timestamp(arrow_cast(ts, 'Utf8View'), '%+')
+FROM (VALUES ('2020-09-08T13:42:29.190855123Z'), (NULL)) AS t(ts);
+----
+2020-09-08T13:42:29.190855123
+NULL
+
+# a scalar format containing %Z uses the named timezone fallback
+query P rowsort
+SELECT to_timestamp(ts, '%Y-%m-%d %H:%M:%S %Z')
+FROM (VALUES ('2020-09-08 13:42:29 UTC'), (NULL)) AS t(ts);
+----
+2020-09-08T13:42:29
+NULL
+
 # to_timestamp with invalid formatting
 query error input contains invalid characters
 SELECT to_timestamp('2020-09-08 12/00/00+00:00', '%c', '%+')
