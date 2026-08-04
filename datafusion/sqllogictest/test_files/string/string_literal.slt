@@ -197,6 +197,9 @@ SELECT character_length(NULL)
 ----
 NULL
 
+query error DataFusion error: Error during planning: Function 'character_length' requires String, but received Int64 \(DataType: Int64\)
+SELECT character_length(10)
+
 query B
 SELECT ends_with('foobar', 'bar')
 ----
@@ -568,6 +571,12 @@ query T
 SELECT reverse(NULL)
 ----
 NULL
+
+query error DataFusion error: Error during planning: Function 'reverse' requires String, but received Boolean \(DataType: Boolean\)
+SELECT reverse(true)
+
+query error DataFusion error: Error during planning: Function 'reverse' requires String, but received List
+SELECT reverse([1, 2, 3])
 
 query T
 SELECT reverse(arrow_cast(NULL, 'LargeUtf8'))

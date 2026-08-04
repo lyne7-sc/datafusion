@@ -25,7 +25,7 @@ use DataType::{LargeUtf8, Utf8, Utf8View};
 use arrow::array::{Array, ArrayRef, AsArray, StringArrayType};
 use arrow::datatypes::DataType;
 use datafusion_common::Result;
-use datafusion_common::types::{NativeType, logical_string};
+use datafusion_common::types::{NativeType, logical_binary, logical_string};
 use datafusion_expr::{
     Coercion, ColumnarValue, Documentation, EncodingPreservation, ScalarFunctionArgs,
     ScalarUDFImpl, Signature, TypeSignatureClass, Volatility,
@@ -64,7 +64,7 @@ impl ReverseFunc {
                 vec![
                     Coercion::new_implicit(
                         TypeSignatureClass::Native(logical_string()),
-                        vec![TypeSignatureClass::Any],
+                        vec![TypeSignatureClass::Native(logical_binary())],
                         NativeType::String,
                     )
                     .with_encoding_preservation(EncodingPreservation::dictionary()),
