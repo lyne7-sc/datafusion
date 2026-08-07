@@ -816,13 +816,16 @@ fn to_timestamp_impl<T: ArrowTimestampType + ScalarType<i64>>(
             &Timestamp(T::UNIT, timezone.clone()),
         ),
         n if n >= 2 => {
-            if let [ColumnarValue::Array(_), ColumnarValue::Scalar(format)] = args
-                && let Some(format) = format.try_as_str().flatten()
-                && let Some(format) = CompiledTimestampFormat::try_new(format)
+            if matches!(args[0], ColumnarValue::Array(_))
+                && let Some(formats) = compile_scalar_formats(&args[1..])
+                && !formats.is_empty()
             {
                 handle::<T, _>(
                     &args[..1],
-                    move |s| format.parse_nanos(&tz, s).map(|value| value / factor),
+                    move |s| {
+                        parse_timestamp_with_formats(&formats, &tz, s)
+                            .map(|value| value / factor)
+                    },
                     name,
                     &Timestamp(T::UNIT, timezone.clone()),
                 )
@@ -840,6 +843,40 @@ fn to_timestamp_impl<T: ArrowTimestampType + ScalarType<i64>>(
         }
         _ => exec_err!("Unsupported 0 argument count for function {name}"),
     }
+}
+
+/// Compile all non-null scalar formats, returning `None` if any format cannot be
+/// precompiled.
+fn compile_scalar_formats<'a>(
+    args: &'a [ColumnarValue],
+) -> Option<Vec<CompiledTimestampFormat<'a>>> {
+    let mut formats = Vec::with_capacity(args.len());
+    for arg in args {
+        let ColumnarValue::Scalar(format) = arg else {
+            return None;
+        };
+        if let Some(format) = format.try_as_str()? {
+            formats.push(CompiledTimestampFormat::try_new(format)?);
+        }
+    }
+    Some(formats)
+}
+
+/// Parse using scalar formats in order, returning the first successful result.
+fn parse_timestamp_with_formats(
+    formats: &[CompiledTimestampFormat<'_>],
+    timezone: &Option<Tz>,
+    value: &str,
+) -> Result<i64> {
+    let mut last_error = None;
+    for format in formats {
+        match format.parse_nanos(timezone, value) {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.expect("at least one non-null scalar format"))
 }
 
 #[cfg(test)]
