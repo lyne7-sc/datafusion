@@ -364,14 +364,23 @@ where
             // traversals on its normal conditional children.
             match C::conditional_children(node) {
                 Some((normal, conditional)) => {
-                    normal
-                        .into_iter()
-                        .try_for_each(|n| n.visit(self).map(|_| ()))?;
-                    self.conditional = true;
-                    conditional
-                        .into_iter()
-                        .try_for_each(|n| n.visit(self).map(|_| ()))?;
-                    self.conditional = false;
+                    // Preserve the node's original child order so this traversal
+                    // stays aligned with the subsequent rewriting traversal.
+                    node.apply_children(|child| {
+                        let is_normal = normal
+                            .iter()
+                            .any(|candidate| std::ptr::eq(*candidate, child));
+                        let is_conditional = conditional
+                            .iter()
+                            .any(|candidate| std::ptr::eq(*candidate, child));
+                        debug_assert_ne!(is_normal, is_conditional);
+
+                        let previous = self.conditional;
+                        self.conditional = previous || is_conditional;
+                        let result = child.visit(self);
+                        self.conditional = previous;
+                        result
+                    })?;
 
                     TreeNodeRecursion::Jump
                 }

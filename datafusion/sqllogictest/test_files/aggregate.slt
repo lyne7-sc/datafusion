@@ -6380,6 +6380,27 @@ SELECT avg(1) FILTER (WHERE NULL)
 ----
 NULL
 
+# CSE preserves conditional evaluation across different aggregate filters
+query IR
+SELECT SUM(10 / x) FILTER (WHERE x <> 0),
+       AVG(10 / x) FILTER (WHERE x > 0)
+FROM (VALUES (0), (-2), (2)) AS t(x)
+----
+0 5
+
+# Filtered window aggregates with a shared argument and different filters
+query IIII
+SELECT id, x,
+  SUM(10 / x) FILTER (WHERE x <> 0) OVER (ORDER BY id),
+  MAX(10 / x) FILTER (WHERE x > 0) OVER (ORDER BY id)
+FROM (VALUES (1, 2), (2, 0), (3, -2), (4, 5)) AS t(id, x)
+ORDER BY id
+----
+1 2 5 5
+2 0 5 5
+3 -2 0 5
+4 5 2 5
+
 # window_aggregate_with_untyped_null_filter
 query I
 SELECT count(*) FILTER (WHERE NULL) OVER ()
