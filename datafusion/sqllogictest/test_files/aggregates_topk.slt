@@ -766,6 +766,52 @@ set datafusion.execution.batch_size = 8192;
 statement ok
 set datafusion.execution.target_partitions = 4;
 
+# Keep the TopK limit on the outer aggregate's Final/Partial, not the nested aggregate.
+query TT
+EXPLAIN SELECT column1 % 2, MAX(column2)
+FROM (
+  SELECT column1, MAX(column2) AS column2
+  FROM (VALUES (0, 100), (2, 90), (1, 80))
+  GROUP BY column1
+)
+GROUP BY column1 % 2
+ORDER BY MAX(column2) DESC NULLS LAST
+LIMIT 2;
+----
+logical_plan
+01)Sort: max(column2) DESC NULLS LAST, fetch=2
+02)--Aggregate: groupBy=[[column1 % Int64(2)]], aggr=[[max(column2)]]
+03)----Projection: column1, max(column2) AS column2
+04)------Aggregate: groupBy=[[column1]], aggr=[[max(column2)]]
+05)--------Values: (Int64(0), Int64(100)), (Int64(2), Int64(90)), (Int64(1), Int64(80))
+physical_plan
+01)SortPreservingMergeExec: [max(column2)@1 DESC NULLS LAST], fetch=2
+02)--SortExec: TopK(fetch=2), expr=[max(column2)@1 DESC NULLS LAST], preserve_partitioning=[true]
+03)----AggregateExec: mode=FinalPartitioned, gby=[column1 % Int64(2)@0 as column1 % Int64(2)], aggr=[max(column2)], lim=[2]
+04)------RepartitionExec: partitioning=Hash([column1 % Int64(2)@0], 4), input_partitions=4
+05)--------AggregateExec: mode=Partial, gby=[column1@0 % 2 as column1 % Int64(2)], aggr=[max(column2)], lim=[2]
+06)----------ProjectionExec: expr=[column1@0 as column1, max(column2)@1 as column2]
+07)------------AggregateExec: mode=FinalPartitioned, gby=[column1@0 as column1], aggr=[max(column2)]
+08)--------------RepartitionExec: partitioning=Hash([column1@0], 4), input_partitions=1
+09)----------------AggregateExec: mode=Partial, gby=[column1@0 as column1], aggr=[max(column2)]
+10)------------------DataSourceExec: partitions=1, partition_sizes=[1]
+
+# The outer aggregate's limit must not reach the nested logical aggregate.
+# Both inner TopK rows would belong to bucket 0, incorrectly dropping bucket 1.
+query II
+SELECT column1 % 2, MAX(column2)
+FROM (
+  SELECT column1, MAX(column2) AS column2
+  FROM (VALUES (0, 100), (2, 90), (1, 80))
+  GROUP BY column1
+)
+GROUP BY column1 % 2
+ORDER BY MAX(column2) DESC NULLS LAST
+LIMIT 2;
+----
+0 100
+1 80
+
 statement ok
 drop table topk_batches;
 
