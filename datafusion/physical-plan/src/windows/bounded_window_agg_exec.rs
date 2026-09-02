@@ -44,7 +44,7 @@ use crate::{
 use arrow::compute::take_record_batch;
 use arrow::{
     array::{Array, ArrayRef, RecordBatchOptions, UInt32Array, UInt32Builder},
-    compute::{concat, concat_batches, sort_to_indices, take_arrays},
+    compute::{concat, sort_to_indices, take_arrays},
     datatypes::SchemaRef,
     record_batch::RecordBatch,
 };
@@ -624,21 +624,117 @@ impl ExecutionPlan for BoundedWindowAggExec {
     }
 }
 
+/// Pending input for [`BoundedWindowAggStream`], retained in its original batch
+/// boundaries so appending new input does not copy rows that are still waiting
+/// for their window results.
+#[derive(Debug, Default)]
+struct WindowInputBuffer {
+    batches: VecDeque<RecordBatch>,
+    num_rows: usize,
+}
+
+impl WindowInputBuffer {
+    fn push(&mut self, batch: RecordBatch) {
+        if batch.num_rows() == 0 {
+            return;
+        }
+        self.num_rows += batch.num_rows();
+        self.batches.push_back(batch);
+    }
+
+    fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    fn batches(&self) -> impl Iterator<Item = &RecordBatch> {
+        self.batches.iter()
+    }
+
+    /// Combines a finalized prefix of the input with its window columns while
+    /// preserving input batch boundaries. This method does not consume input,
+    /// so the caller can construct every output batch before committing state.
+    fn build_output_batches(
+        &self,
+        schema: &SchemaRef,
+        window_columns: &[ArrayRef],
+    ) -> Result<VecDeque<RecordBatch>> {
+        let Some(first_window_column) = window_columns.first() else {
+            return Ok(VecDeque::new());
+        };
+        let n_out = first_window_column.len();
+        if window_columns.iter().any(|column| column.len() != n_out) {
+            return exec_err!("Window columns have different lengths");
+        }
+        if n_out > self.num_rows {
+            return exec_err!(
+                "Cannot build {n_out} window rows from {} buffered input rows",
+                self.num_rows
+            );
+        }
+
+        let mut output = VecDeque::new();
+        let mut offset = 0;
+        for batch in &self.batches {
+            if offset == n_out {
+                break;
+            }
+            let len = min(batch.num_rows(), n_out - offset);
+            let input_columns = batch.columns().iter().map(|column| {
+                if len == batch.num_rows() {
+                    Arc::clone(column)
+                } else {
+                    column.slice(0, len)
+                }
+            });
+            let window_columns = window_columns
+                .iter()
+                .map(|column| column.slice(offset, len));
+            let columns = input_columns.chain(window_columns).collect::<Vec<_>>();
+            output.push_back(RecordBatch::try_new_with_options(
+                Arc::clone(schema),
+                columns,
+                &RecordBatchOptions::new().with_row_count(Some(len)),
+            )?);
+            offset += len;
+        }
+        debug_assert_eq!(offset, n_out);
+        Ok(output)
+    }
+
+    fn consume(&mut self, mut n_rows: usize) {
+        assert!(n_rows <= self.num_rows);
+        self.num_rows -= n_rows;
+        while n_rows > 0 {
+            let batch = self
+                .batches
+                .pop_front()
+                .expect("buffered row count must match its batches");
+            if n_rows < batch.num_rows() {
+                self.batches
+                    .push_front(batch.slice(n_rows, batch.num_rows() - n_rows));
+                break;
+            }
+            n_rows -= batch.num_rows();
+        }
+    }
+}
+
 /// Trait that specifies how we search for (or calculate) partitions. It has two
 /// implementations: [`SortedSearch`] and [`LinearSearch`].
 trait PartitionSearcher: Send {
     /// This method constructs output columns using the result of each window expression
     /// (each entry in the output vector comes from a window expression).
-    /// Executor when producing output concatenates `input_buffer` (corresponding section), and
-    /// result of this function to generate output `RecordBatch`. `input_buffer` is used to determine
-    /// which sections of the window expression results should be used to generate output.
+    /// The executor combines the finalized prefix of `input_buffer` with this
+    /// result to generate output `RecordBatch`es. `input_buffer` is used to
+    /// determine which sections of the window expression results should be
+    /// emitted.
     /// `partition_buffers` contains corresponding section of the `RecordBatch` for each partition.
     /// `window_agg_states` stores per partition state for each window expression.
     /// None case means that no result is generated
     /// `Some(Vec<ArrayRef>)` is the result of each window expression.
     fn calculate_out_columns(
         &mut self,
-        input_buffer: &RecordBatch,
+        input_buffer: &WindowInputBuffer,
         window_agg_states: &[PartitionWindowAggStates],
         partition_buffers: &mut PartitionBatches,
         window_expr: &[Arc<dyn WindowExpr>],
@@ -666,7 +762,7 @@ trait PartitionSearcher: Send {
     /// Updates `input_buffer` and `partition_buffers` with the new `record_batch`.
     fn update_partition_batch(
         &mut self,
-        input_buffer: &mut RecordBatch,
+        input_buffer: &mut WindowInputBuffer,
         record_batch: RecordBatch,
         window_expr: &[Arc<dyn WindowExpr>],
         partition_buffers: &mut PartitionBatches,
@@ -700,11 +796,7 @@ trait PartitionSearcher: Send {
 
         self.mark_partition_end(partition_buffers);
 
-        *input_buffer = if input_buffer.num_rows() == 0 {
-            record_batch
-        } else {
-            concat_batches(self.input_schema(), [input_buffer, &record_batch])?
-        };
+        input_buffer.push(record_batch);
 
         Ok(())
     }
@@ -716,7 +808,7 @@ trait PartitionSearcher: Send {
 /// algorithm for computing partitions.
 pub struct LinearSearch {
     /// Keeps the hash of input buffer calculated from PARTITION BY columns.
-    /// Its length is equal to the `input_buffer` length.
+    /// Its length is equal to the number of rows in `input_buffer`.
     input_buffer_hashes: VecDeque<u64>,
     /// Used during hash value calculation.
     random_state: RandomState,
@@ -775,7 +867,7 @@ impl PartitionSearcher for LinearSearch {
     // Above section corresponds to calculated result which can be emitted without breaking input buffer ordering.
     fn calculate_out_columns(
         &mut self,
-        input_buffer: &RecordBatch,
+        input_buffer: &WindowInputBuffer,
         window_agg_states: &[PartitionWindowAggStates],
         partition_buffers: &mut PartitionBatches,
         window_expr: &[Arc<dyn WindowExpr>],
@@ -975,48 +1067,57 @@ impl LinearSearch {
     /// stores indices of the rows for which the partition is constructed.
     fn calc_partition_output_indices(
         &mut self,
-        input_buffer: &RecordBatch,
+        input_buffer: &WindowInputBuffer,
         window_agg_states: &[PartitionWindowAggStates],
         window_expr: &[Arc<dyn WindowExpr>],
     ) -> Result<Vec<(PartitionKey, Vec<u32>)>> {
-        let partition_by_columns =
-            evaluate_partition_by_column_values(input_buffer, window_expr)?;
         // Reset the row_map state:
         self.row_map_out.clear();
         let mut partition_indices: Vec<(PartitionKey, Vec<u32>)> = vec![];
-        for (hash, row_idx) in self.input_buffer_hashes.iter().zip(0u32..) {
-            let entry = self.row_map_out.find_mut(*hash, |(_, group_idx, _)| {
-                let row =
-                    get_row_at_idx(&partition_by_columns, row_idx as usize).unwrap();
-                row == partition_indices[*group_idx].0
-            });
-            if let Some((_, group_idx, n_out)) = entry {
-                let (_, indices) = &mut partition_indices[*group_idx];
-                if indices.len() >= *n_out {
-                    break;
+        debug_assert_eq!(input_buffer.num_rows(), self.input_buffer_hashes.len());
+        let mut hashes = self.input_buffer_hashes.iter();
+        let mut row_idx = 0u32;
+        'batches: for batch in input_buffer.batches() {
+            let partition_by_columns =
+                evaluate_partition_by_column_values(batch, window_expr)?;
+            for batch_row_idx in 0..batch.num_rows() {
+                let hash = hashes
+                    .next()
+                    .expect("input rows and their partition hashes must stay aligned");
+                let entry = self.row_map_out.find_mut(*hash, |(_, group_idx, _)| {
+                    let row =
+                        get_row_at_idx(&partition_by_columns, batch_row_idx).unwrap();
+                    row == partition_indices[*group_idx].0
+                });
+                if let Some((_, group_idx, n_out)) = entry {
+                    let (_, indices) = &mut partition_indices[*group_idx];
+                    if indices.len() >= *n_out {
+                        break 'batches;
+                    }
+                    indices.push(row_idx);
+                } else {
+                    let row = get_row_at_idx(&partition_by_columns, batch_row_idx)?;
+                    let min_out = window_agg_states
+                        .iter()
+                        .map(|window_agg_state| {
+                            window_agg_state
+                                .get(&row)
+                                .map(|partition| partition.state.out_col.len())
+                                .unwrap_or(0)
+                        })
+                        .min()
+                        .unwrap_or(0);
+                    if min_out == 0 {
+                        break 'batches;
+                    }
+                    self.row_map_out.insert_unique(
+                        *hash,
+                        (*hash, partition_indices.len(), min_out),
+                        |(hash, _, _)| *hash,
+                    );
+                    partition_indices.push((row, vec![row_idx]));
                 }
-                indices.push(row_idx);
-            } else {
-                let row = get_row_at_idx(&partition_by_columns, row_idx as usize)?;
-                let min_out = window_agg_states
-                    .iter()
-                    .map(|window_agg_state| {
-                        window_agg_state
-                            .get(&row)
-                            .map(|partition| partition.state.out_col.len())
-                            .unwrap_or(0)
-                    })
-                    .min()
-                    .unwrap_or(0);
-                if min_out == 0 {
-                    break;
-                }
-                self.row_map_out.insert_unique(
-                    *hash,
-                    (*hash, partition_indices.len(), min_out),
-                    |(hash, _, _)| *hash,
-                );
-                partition_indices.push((row, vec![row_idx]));
+                row_idx += 1;
             }
         }
         Ok(partition_indices)
@@ -1040,7 +1141,7 @@ impl PartitionSearcher for SortedSearch {
     /// This method constructs new output columns using the result of each window expression.
     fn calculate_out_columns(
         &mut self,
-        _input_buffer: &RecordBatch,
+        _input_buffer: &WindowInputBuffer,
         window_agg_states: &[PartitionWindowAggStates],
         partition_buffers: &mut PartitionBatches,
         _window_expr: &[Arc<dyn WindowExpr>],
@@ -1173,9 +1274,12 @@ fn evaluate_partition_by_column_values(
 pub struct BoundedWindowAggStream {
     schema: SchemaRef,
     input: SendableRecordBatchStream,
-    /// The record batch executor receives as input (i.e. the columns needed
-    /// while calculating aggregation results).
-    input_buffer: RecordBatch,
+    /// Input rows waiting for their window results, retained at their original
+    /// batch boundaries.
+    input_buffer: WindowInputBuffer,
+    /// Finalized output split at input batch boundaries. This is drained before
+    /// polling the input again, including after the input reaches end-of-stream.
+    pending_output: VecDeque<RecordBatch>,
     /// Each partition's rows, accumulated across input batches. All window
     /// expressions calculate their results against these shared rows without
     /// copying.
@@ -1278,6 +1382,12 @@ impl Stream for BoundedWindowAggStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let poll = self.poll_next_inner(cx);
+        if matches!(poll, Poll::Ready(Some(Err(_)))) {
+            self.finished = true;
+            self.pending_output.clear();
+            let input_schema = self.input.schema();
+            self.input = Box::pin(EmptyRecordBatchStream::new(input_schema));
+        }
         self.baseline_metrics.record_poll(poll)
     }
 }
@@ -1294,11 +1404,11 @@ impl BoundedWindowAggStream {
         state_observer: Option<Arc<dyn WindowStateObserver>>,
     ) -> Result<Self> {
         let state = window_expr.iter().map(|_| IndexMap::default()).collect();
-        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
         Ok(Self {
             schema,
             input,
-            input_buffer: empty_batch,
+            input_buffer: WindowInputBuffer::default(),
+            pending_output: VecDeque::new(),
             partition_buffers: IndexMap::default(),
             window_agg_states: state,
             finished: false,
@@ -1342,17 +1452,12 @@ impl BoundedWindowAggStream {
         )?;
         if let Some(window_expr_out) = window_expr_out {
             let n_out = window_expr_out[0].len();
-            // right append new columns to corresponding section in the original input buffer.
-            let columns_to_show = self
+            let output = self
                 .input_buffer
-                .columns()
-                .iter()
-                .map(|elem| elem.slice(0, n_out))
-                .chain(window_expr_out)
-                .collect::<Vec<_>>();
-            let n_generated = columns_to_show[0].len();
-            self.prune_state(n_generated)?;
-            Ok(Some(RecordBatch::try_new(schema, columns_to_show)?))
+                .build_output_batches(&schema, &window_expr_out)?;
+            self.prune_state(n_out)?;
+            self.pending_output.extend(output);
+            Ok(self.pending_output.pop_front())
         } else {
             Ok(None)
         }
@@ -1363,6 +1468,9 @@ impl BoundedWindowAggStream {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
+        if let Some(batch) = self.pending_output.pop_front() {
+            return Poll::Ready(Some(Ok(batch)));
+        }
         if self.finished {
             return Poll::Ready(None);
         }
@@ -1489,19 +1597,7 @@ impl BoundedWindowAggStream {
     /// Prunes the section of the input batch whose aggregate results
     /// are calculated and emitted.
     fn prune_input_batch(&mut self, n_out: usize) -> Result<()> {
-        // Prune first n_out rows from the input_buffer
-        let n_to_keep = self.input_buffer.num_rows() - n_out;
-        let batch_to_keep = self
-            .input_buffer
-            .columns()
-            .iter()
-            .map(|elem| elem.slice(n_out, n_to_keep))
-            .collect::<Vec<_>>();
-        self.input_buffer = RecordBatch::try_new_with_options(
-            self.input_buffer.schema(),
-            batch_to_keep,
-            &RecordBatchOptions::new().with_row_count(Some(n_to_keep)),
-        )?;
+        self.input_buffer.consume(n_out);
         Ok(())
     }
 
@@ -2273,7 +2369,7 @@ mod tests {
         // after the input is exhausted.
         assert_eq!(
             batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
-            vec![1, 5, 2],
+            vec![1, 2, 2, 1, 2],
             "expected results to stream as they become final"
         );
 
@@ -3052,6 +3148,356 @@ mod tests {
             plan.cardinality_effect(),
             CardinalityEffect::Equal
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn window_input_buffer_preserves_batch_boundaries() -> Result<()> {
+        use super::WindowInputBuffer;
+        use arrow::array::{ArrayRef, Int32Array};
+
+        let input_schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("window", DataType::Int32, false),
+        ]));
+        let first_col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let second_col: ArrayRef = Arc::new(Int32Array::from(vec![4, 5, 6]));
+        let first = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::clone(&first_col)],
+        )?;
+        let second = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::clone(&second_col)],
+        )?;
+
+        let mut buffer = WindowInputBuffer::default();
+        buffer.push(first);
+        buffer.push(second);
+        let window_col: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30, 40]));
+        let output = buffer.build_output_batches(&output_schema, &[window_col])?;
+
+        assert_eq!(
+            output.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        assert!(Arc::ptr_eq(output[0].column(0), &first_col));
+        assert_eq!(
+            output[1]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[4]
+        );
+
+        buffer.consume(4);
+        assert_eq!(buffer.num_rows(), 2);
+        let remaining = buffer.batches().next().unwrap();
+        assert_eq!(remaining.num_rows(), 2);
+        let remaining_values = remaining
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values();
+        let second_values = second_col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values();
+        assert_eq!(remaining_values, &[5, 6]);
+        assert_eq!(
+            remaining_values.inner().data_ptr(),
+            second_values.inner().data_ptr(),
+            "consuming part of a batch should retain its allocation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn window_input_buffer_preserves_zero_column_row_counts() -> Result<()> {
+        use super::WindowInputBuffer;
+        use arrow::array::{ArrayRef, Int32Array};
+        use arrow::record_batch::RecordBatchOptions;
+
+        let input_schema = Arc::new(Schema::empty());
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "window",
+            DataType::Int32,
+            false,
+        )]));
+        let make_batch = |n_rows| {
+            RecordBatch::try_new_with_options(
+                Arc::clone(&input_schema),
+                vec![],
+                &RecordBatchOptions::new().with_row_count(Some(n_rows)),
+            )
+        };
+
+        let mut buffer = WindowInputBuffer::default();
+        buffer.push(make_batch(2)?);
+        buffer.push(make_batch(3)?);
+        let window_col: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
+        let output = buffer.build_output_batches(&output_schema, &[window_col])?;
+        assert_eq!(
+            output.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![2, 2]
+        );
+
+        buffer.consume(4);
+        assert_eq!(buffer.num_rows(), 1);
+        assert_eq!(buffer.batches().next().unwrap().num_rows(), 1);
+        Ok(())
+    }
+
+    fn make_chunked_window_batch(
+        schema: &SchemaRef,
+        rows: &[(u64, u64)],
+    ) -> Result<RecordBatch> {
+        let mut pk = UInt64Builder::with_capacity(rows.len());
+        let mut ts = UInt64Builder::with_capacity(rows.len());
+        for (p, t) in rows {
+            pk.append_value(*p);
+            ts.append_value(*t);
+        }
+        Ok(RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::new(pk.finish()), Arc::new(ts.finish())],
+        )?)
+    }
+
+    async fn run_chunked_input_case(
+        rows: &[&[(u64, u64)]],
+        mode: InputOrderMode,
+    ) -> Result<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::UInt64, false),
+            Field::new("ts", DataType::UInt64, false),
+        ]));
+        let batches = rows
+            .iter()
+            .map(|rows| make_chunked_window_batch(&schema, rows))
+            .collect::<Result<Vec<_>>>()?;
+        let input_ordering: LexOrdering = match &mode {
+            InputOrderMode::Linear => [PhysicalSortExpr {
+                expr: col("ts", &schema)?,
+                options: SortOptions::default(),
+            }]
+            .into(),
+            InputOrderMode::Sorted | InputOrderMode::PartiallySorted(_) => [
+                PhysicalSortExpr {
+                    expr: col("pk", &schema)?,
+                    options: SortOptions::default(),
+                },
+                PhysicalSortExpr {
+                    expr: col("ts", &schema)?,
+                    options: SortOptions::default(),
+                },
+            ]
+            .into(),
+        };
+        let source = TestMemoryExec::try_new(&[batches], Arc::clone(&schema), None)?
+            .try_with_sort_information(vec![input_ordering])?;
+        let input = Arc::new(TestMemoryExec::update_cache(&Arc::new(source)));
+        let expr = create_window_expr(
+            &WindowFunctionDefinition::AggregateUDF(count_udaf()),
+            "count".to_string(),
+            &[col("ts", &schema)?],
+            &[col("pk", &schema)?],
+            &[PhysicalSortExpr {
+                expr: col("ts", &schema)?,
+                options: SortOptions::default(),
+            }],
+            Arc::new(WindowFrame::new_bounds(
+                WindowFrameUnits::Rows,
+                WindowFrameBound::CurrentRow,
+                WindowFrameBound::Following(ScalarValue::UInt64(Some(2))),
+            )),
+            Arc::clone(&schema),
+            false,
+            false,
+            None,
+        )?;
+        let plan = Arc::new(BoundedWindowAggExec::try_new(
+            vec![expr],
+            input,
+            mode,
+            false,
+        )?) as Arc<dyn ExecutionPlan>;
+        collect(plan.execute(0, task_context())?).await
+    }
+
+    fn assert_chunked_input_output(
+        batches: &[RecordBatch],
+        expected_batch_sizes: &[usize],
+        expected_rows: &[(u64, u64, i64)],
+    ) {
+        use arrow::array::{Int64Array, UInt64Array};
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            expected_batch_sizes
+        );
+        let rows = batches
+            .iter()
+            .flat_map(|batch| {
+                let pk = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                let ts = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                let counts = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (0..batch.num_rows())
+                    .map(|row| (pk.value(row), ts.value(row), counts.value(row)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected_rows);
+    }
+
+    #[tokio::test]
+    async fn bounded_window_chunked_input_linear() -> Result<()> {
+        let batches = run_chunked_input_case(
+            &[
+                &[(0, 0), (1, 1), (0, 2)],
+                &[(1, 3), (0, 4)],
+                &[(1, 5), (0, 6), (1, 7)],
+            ],
+            InputOrderMode::Linear,
+        )
+        .await?;
+        assert_chunked_input_output(
+            &batches,
+            &[2, 1, 2, 3],
+            &[
+                (0, 0, 3),
+                (1, 1, 3),
+                (0, 2, 3),
+                (1, 3, 3),
+                (0, 4, 2),
+                (1, 5, 2),
+                (0, 6, 1),
+                (1, 7, 1),
+            ],
+        );
+        Ok(())
+    }
+
+    async fn assert_sorted_chunked_input(mode: InputOrderMode) -> Result<()> {
+        let batches = run_chunked_input_case(
+            &[
+                &[(0, 0), (0, 1), (0, 2)],
+                &[(0, 3), (1, 0)],
+                &[(1, 1), (1, 2), (1, 3)],
+            ],
+            mode,
+        )
+        .await?;
+        assert_chunked_input_output(
+            &batches,
+            &[3, 1, 1, 3],
+            &[
+                (0, 0, 3),
+                (0, 1, 3),
+                (0, 2, 2),
+                (0, 3, 1),
+                (1, 0, 3),
+                (1, 1, 3),
+                (1, 2, 2),
+                (1, 3, 1),
+            ],
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_window_chunked_input_sorted() -> Result<()> {
+        assert_sorted_chunked_input(InputOrderMode::Sorted).await
+    }
+
+    #[tokio::test]
+    async fn bounded_window_chunked_input_partially_sorted() -> Result<()> {
+        assert_sorted_chunked_input(InputOrderMode::PartiallySorted(vec![0])).await
+    }
+
+    #[tokio::test]
+    async fn bounded_window_error_is_terminal() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::{BoundedWindowAggStream, SortedSearch, create_schema};
+        use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+        use crate::stream::RecordBatchStreamAdapter;
+
+        let input_schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::new(arrow::array::UInt64Array::from(vec![1]))],
+        )?;
+        let expr = create_window_expr(
+            &WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+            "row_number".to_string(),
+            &[],
+            &[],
+            &[],
+            Arc::new(WindowFrame::new(None)),
+            Arc::clone(&input_schema),
+            false,
+            false,
+            None,
+        )?;
+        let output_schema =
+            Arc::new(create_schema(&input_schema, std::slice::from_ref(&expr))?);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let stream_polls = Arc::clone(&polls);
+        let child = futures::stream::poll_fn(move |_| {
+            let poll = stream_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(match poll {
+                0 => Some(Err(exec_datafusion_err!("expected child error"))),
+                1 => Some(Ok(batch.clone())),
+                _ => None,
+            })
+        });
+        let input = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&input_schema),
+            child,
+        ));
+        let search_mode = Box::new(SortedSearch {
+            partition_by_sort_keys: vec![],
+            ordered_partition_by_indices: vec![],
+            input_schema,
+        });
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut stream = BoundedWindowAggStream::new(
+            output_schema,
+            vec![expr],
+            input,
+            BaselineMetrics::new(&metrics, 0),
+            search_mode,
+            0,
+            None,
+        )?;
+
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("expected child error"));
+        assert!(stream.next().await.is_none());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

@@ -51,6 +51,9 @@
 //! - `sorted count N partitions`: control; input sorted by partition key,
 //!   as `Sorted` mode requires, so finished partitions are pruned eagerly
 //!   and the state maps stay small.
+//! - `sorted single count rows 65536 following 16 batches`: one partition
+//!   with a large finite ROWS lookahead, so eight input batches remain
+//!   buffered before the first result can be finalized.
 
 use std::sync::Arc;
 
@@ -76,6 +79,7 @@ use datafusion_physical_plan::{ExecutionPlan, InputOrderMode, collect};
 
 const BATCH_SIZE: usize = 8192;
 const N_BATCHES: usize = 16;
+const LARGE_FOLLOWING_ROWS: usize = 8 * BATCH_SIZE;
 /// Distinct partition keys per batch in the sparse layout. Each batch
 /// introduces this many previously-unseen keys, so the total partition count
 /// is `N_BATCHES * SPARSE_KEYS_PER_BATCH`.
@@ -150,6 +154,17 @@ fn rows_frame() -> WindowFrame {
         WindowFrameUnits::Rows,
         WindowFrameBound::CurrentRow,
         WindowFrameBound::Following(ScalarValue::UInt64(Some(2))),
+    )
+}
+
+/// `ROWS BETWEEN CURRENT ROW AND 65536 FOLLOWING`
+fn large_rows_following_frame() -> WindowFrame {
+    WindowFrame::new_bounds(
+        WindowFrameUnits::Rows,
+        WindowFrameBound::CurrentRow,
+        WindowFrameBound::Following(ScalarValue::UInt64(Some(
+            LARGE_FOLLOWING_ROWS as u64,
+        ))),
     )
 }
 
@@ -260,16 +275,19 @@ fn bounded_window_benchmark(c: &mut Criterion) {
     group.sample_size(10);
 
     let mut run_case = |name: String, plan: Arc<dyn ExecutionPlan>| {
+        let task_ctx = Arc::new(TaskContext::default());
+        let output = rt
+            .block_on(collect(Arc::clone(&plan), task_ctx))
+            .expect("validation execution");
+        assert_eq!(
+            output.iter().map(|b| b.num_rows()).sum::<usize>(),
+            BATCH_SIZE * N_BATCHES
+        );
         group.bench_function(name, |b| {
             b.iter(|| {
                 let task_ctx = Arc::new(TaskContext::default());
-                let batches = rt
-                    .block_on(collect(Arc::clone(&plan), task_ctx))
-                    .expect("execution");
-                assert_eq!(
-                    batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-                    BATCH_SIZE * N_BATCHES
-                );
+                rt.block_on(collect(Arc::clone(&plan), task_ctx))
+                    .expect("execution")
             })
         });
     };
@@ -382,6 +400,19 @@ fn bounded_window_benchmark(c: &mut Criterion) {
             InputOrderMode::Sorted,
             vec![sort_expr("pk"), sort_expr("ts")],
             &range_frame(),
+            &[count()],
+        ),
+    );
+
+    run_case(
+        format!(
+            "sorted single count rows {LARGE_FOLLOWING_ROWS} following {N_BATCHES} batches"
+        ),
+        window_exec(
+            sorted_batches(1),
+            InputOrderMode::Sorted,
+            vec![sort_expr("pk"), sort_expr("ts")],
+            &large_rows_following_frame(),
             &[count()],
         ),
     );
