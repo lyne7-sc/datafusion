@@ -48,10 +48,12 @@
 //! +---+---+---+
 //! ```
 //!
-//! The plan concats incoming data with such last rows of previous input
-//! and continues partial sorting of the segments.
+//! The plan buffers the trailing prefix group across incoming batches and
+//! continues partial sorting once that group is complete.
 
+use std::cmp::Ordering;
 use std::fmt::Debug;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -66,12 +68,14 @@ use crate::{
     SendableRecordBatchStream, Statistics, validate_child_count,
 };
 
-use arrow::compute::concat_batches;
+use arrow::compute::{
+    SortColumn, concat, concat_batches, interleave_record_batch, lexsort_to_indices,
+};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::utils::evaluate_partition_ranges;
+use datafusion_common::utils::{compare_rows, evaluate_partition_ranges, get_row_at_idx};
 use datafusion_execution::{RecordBatchStream, TaskContext};
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 
@@ -149,9 +153,9 @@ use log::trace;
 ///        +---+---+---+
 /// ```
 ///
-/// Once known complete, the buffered rows are sorted by the full `(a, b, c)`
-/// ordering and emitted as a [`RecordBatch`]; Any rows from the most recently
-/// seen prefix remain buffered (as more rows with the same prefix may arrive in
+/// Once known complete, each prefix group is sorted by the remaining suffix
+/// ordering and emitted as a [`RecordBatch`]. Any rows from the most recently
+/// seen prefix remain buffered, as more rows with the same prefix may arrive in
 /// future batches.
 ///
 /// ```text
@@ -162,9 +166,9 @@ use log::trace;
 ///        | 0 | 0 | 1 |   <-- completed group
 ///        | 0 | 0 | 2 |
 ///        | 0 | 0 | 3 |
+///        | 0 | 1 | 1 |   <-- completed group
 ///        | 0 | 2 | 0 |   <-- completed group
 ///        | 0 | 2 | 4 |
-///        | 0 | 1 | 1 |   <-- completed group
 ///        +---+---+---+
 ///
 ///            Buffer
@@ -455,7 +459,10 @@ impl ExecutionPlan for PartialSortExec {
             input,
             expr: self.expr.clone(),
             common_prefix_length: self.common_prefix_length,
-            in_mem_batch: RecordBatch::new_empty(Arc::clone(&self.schema())),
+            suffix_expr: LexOrdering::new(
+                self.expr.iter().skip(self.common_prefix_length).cloned(),
+            ),
+            in_mem_batches: vec![],
             fetch: self.fetch,
             is_closed: false,
             baseline_metrics: BaselineMetrics::new(&self.metrics_set, partition),
@@ -487,14 +494,33 @@ struct PartialSortStream {
     /// Length of prefix common to input ordering and required ordering of plan
     /// should be more than 0 otherwise PartialSort is not applicable
     common_prefix_length: usize,
-    /// Used as a buffer for part of the input not ready for sort
-    in_mem_batch: RecordBatch,
+    /// Sort expressions not already satisfied by the input ordering
+    suffix_expr: Option<LexOrdering>,
+    /// Fragments of the trailing prefix group that is not ready for sort
+    in_mem_batches: Vec<RecordBatch>,
     /// Fetch top N results
     fetch: Option<usize>,
     /// Whether the stream has finished returning all of its data or not
     is_closed: bool,
     /// Execution metrics
     baseline_metrics: BaselineMetrics,
+}
+
+#[derive(Debug)]
+struct PrefixBatchRange {
+    batch_idx: usize,
+    range: Range<usize>,
+}
+
+fn whole_batches_prefix(batches: &[RecordBatch]) -> Vec<PrefixBatchRange> {
+    batches
+        .iter()
+        .enumerate()
+        .map(|(batch_idx, batch)| PrefixBatchRange {
+            batch_idx,
+            range: 0..batch.num_rows(),
+        })
+        .collect()
 }
 
 impl Stream for PartialSortStream {
@@ -540,26 +566,72 @@ impl PartialSortStream {
 
             match ready!(self.input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {
-                    // Merge new batch into in_mem_batch
-                    self.in_mem_batch = concat_batches(
-                        &self.schema(),
-                        &[self.in_mem_batch.clone(), batch],
-                    )?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
 
-                    // Check if we have a slice point, otherwise keep accumulating in `self.in_mem_batch`.
-                    if let Some(slice_point) = self
-                        .get_slice_point(self.common_prefix_length, &self.in_mem_batch)?
-                    {
-                        let sorted = self.in_mem_batch.slice(0, slice_point);
-                        self.in_mem_batch = self.in_mem_batch.slice(
-                            slice_point,
-                            self.in_mem_batch.num_rows() - slice_point,
-                        );
-                        let sorted_batch = sort_batch(&sorted, &self.expr, self.fetch)?;
-                        if let Some(fetch) = self.fetch.as_mut() {
-                            *fetch -= sorted_batch.num_rows();
+                    let prefix_ranges = self.get_prefix_ranges(&batch)?;
+                    let boundary_changed = self
+                        .in_mem_batches
+                        .last()
+                        .map(|previous| {
+                            self.prefix_changed_at_batch_boundary(previous, &batch)
+                        })
+                        .transpose()?
+                        .unwrap_or(false);
+
+                    let completed = if prefix_ranges.len() >= 2 {
+                        let trailing_range = prefix_ranges.last().unwrap();
+                        let trailing_batch =
+                            batch.slice(trailing_range.start, trailing_range.len());
+
+                        let mut completed_batches =
+                            std::mem::take(&mut self.in_mem_batches);
+                        let current_batch_idx = completed_batches.len();
+                        let mut completed_prefixes = if completed_batches.is_empty() {
+                            vec![]
+                        } else {
+                            vec![whole_batches_prefix(&completed_batches)]
+                        };
+
+                        for (idx, range) in prefix_ranges[..prefix_ranges.len() - 1]
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                        {
+                            let current_prefix = PrefixBatchRange {
+                                batch_idx: current_batch_idx,
+                                range,
+                            };
+                            if idx == 0
+                                && !boundary_changed
+                                && let Some(previous_prefix) =
+                                    completed_prefixes.last_mut()
+                            {
+                                previous_prefix.push(current_prefix);
+                                continue;
+                            }
+                            completed_prefixes.push(vec![current_prefix]);
                         }
 
+                        completed_batches.push(batch);
+                        self.in_mem_batches.push(trailing_batch);
+                        Some((completed_batches, completed_prefixes))
+                    } else if boundary_changed {
+                        let completed_batches = std::mem::take(&mut self.in_mem_batches);
+                        let completed_prefix = whole_batches_prefix(&completed_batches);
+                        self.in_mem_batches.push(batch);
+                        Some((completed_batches, vec![completed_prefix]))
+                    } else {
+                        self.in_mem_batches.push(batch);
+                        None
+                    };
+
+                    if let Some((completed_batches, completed_prefixes)) = completed {
+                        let sorted_batch = self.sort_completed_prefixes(
+                            completed_batches,
+                            completed_prefixes,
+                        )?;
                         if sorted_batch.num_rows() > 0 {
                             return Poll::Ready(Some(Ok(sorted_batch)));
                         }
@@ -571,8 +643,16 @@ impl PartialSortStream {
                     // Release the input pipeline's resources before sorting.
                     let input_schema = self.input.schema();
                     self.input = Box::pin(EmptyRecordBatchStream::new(input_schema));
-                    // Once input is consumed, sort the rest of the inserted batches
-                    let remaining_batch = self.sort_in_mem_batch()?;
+                    // Once input is consumed, the trailing prefix is complete.
+                    let completed_batches = std::mem::take(&mut self.in_mem_batches);
+                    if completed_batches.is_empty() {
+                        return Poll::Ready(None);
+                    }
+                    let completed_prefix = whole_batches_prefix(&completed_batches);
+                    let remaining_batch = self.sort_completed_prefixes(
+                        completed_batches,
+                        vec![completed_prefix],
+                    )?;
                     return if remaining_batch.num_rows() > 0 {
                         Poll::Ready(Some(Ok(remaining_batch)))
                     } else {
@@ -583,50 +663,189 @@ impl PartialSortStream {
         }
     }
 
-    /// Returns a sorted RecordBatch from in_mem_batches and clears in_mem_batches
-    ///
-    /// If fetch is specified for PartialSortStream `sort_in_mem_batch` will limit
-    /// the last RecordBatch returned and will mark the stream as closed
-    fn sort_in_mem_batch(self: &mut Pin<&mut Self>) -> Result<RecordBatch> {
-        let input_batch = self.in_mem_batch.clone();
-        self.in_mem_batch = RecordBatch::new_empty(self.schema());
-        let result = sort_batch(&input_batch, &self.expr, self.fetch)?;
-        if let Some(remaining_fetch) = self.fetch {
-            // remaining_fetch - result.num_rows() is always be >= 0
-            // because result length of sort_batch with limit cannot be
-            // more than the requested limit
-            self.fetch = Some(remaining_fetch - result.num_rows());
-            if remaining_fetch == result.num_rows() {
-                self.is_closed = true;
+    fn sort_completed_prefixes(
+        self: &mut Pin<&mut Self>,
+        completed_batches: Vec<RecordBatch>,
+        completed_prefixes: Vec<Vec<PrefixBatchRange>>,
+    ) -> Result<RecordBatch> {
+        debug_assert!(!completed_prefixes.is_empty());
+        let result = if completed_prefixes.len() == 1 {
+            // A single prefix may span batches, so concatenate it at most once.
+            let prefix = completed_prefixes.into_iter().next().unwrap();
+            let mut completed_batches =
+                completed_batches.into_iter().map(Some).collect::<Vec<_>>();
+            let mut prefix_batches = prefix
+                .into_iter()
+                .map(|prefix_range| {
+                    let batch = completed_batches[prefix_range.batch_idx]
+                        .take()
+                        .expect("each source batch occurs once in a single prefix");
+                    if prefix_range.range == (0..batch.num_rows()) {
+                        batch
+                    } else {
+                        batch.slice(prefix_range.range.start, prefix_range.range.len())
+                    }
+                })
+                .collect::<Vec<_>>();
+            let batch = if prefix_batches.len() == 1 {
+                prefix_batches.pop().unwrap()
+            } else {
+                concat_batches(&self.schema(), &prefix_batches)?
+            };
+
+            if let Some(suffix_expr) = &self.suffix_expr {
+                sort_batch(&batch, suffix_expr, self.fetch)?
+            } else {
+                let row_count = self
+                    .fetch
+                    .unwrap_or_else(|| batch.num_rows())
+                    .min(batch.num_rows());
+                batch.slice(0, row_count)
             }
+        } else {
+            // Evaluate suffix expressions once per source batch, then sort each
+            // prefix independently and materialize the result with one interleave.
+            let sort_columns_by_batch = completed_batches
+                .iter()
+                .map(|batch| {
+                    self.suffix_expr
+                        .iter()
+                        .flat_map(|exprs| exprs.iter())
+                        .map(|expr| expr.evaluate_to_sort_column(batch))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut remaining_fetch = self.fetch.unwrap_or(usize::MAX);
+            let mut interleave_indices = vec![];
+
+            for prefix in completed_prefixes {
+                if remaining_fetch == 0 {
+                    break;
+                }
+
+                let row_count = prefix
+                    .iter()
+                    .map(|prefix_range| prefix_range.range.len())
+                    .sum::<usize>();
+                let prefix_fetch = remaining_fetch.min(row_count);
+                let offsets = prefix
+                    .iter()
+                    .scan(0, |offset, prefix_range| {
+                        let current = *offset;
+                        *offset += prefix_range.range.len();
+                        Some(current)
+                    })
+                    .collect::<Vec<_>>();
+
+                let sorted_indices = if let Some(suffix_expr) = &self.suffix_expr {
+                    let sort_columns = suffix_expr
+                        .iter()
+                        .enumerate()
+                        .map(|(sort_idx, expr)| {
+                            let values = prefix
+                                .iter()
+                                .map(|prefix_range| {
+                                    let values = &sort_columns_by_batch
+                                        [prefix_range.batch_idx][sort_idx]
+                                        .values;
+                                    if prefix_range.range
+                                        == (0..completed_batches[prefix_range.batch_idx]
+                                            .num_rows())
+                                    {
+                                        Arc::clone(values)
+                                    } else {
+                                        values.slice(
+                                            prefix_range.range.start,
+                                            prefix_range.range.len(),
+                                        )
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            let values = if values.len() == 1 {
+                                Arc::clone(&values[0])
+                            } else {
+                                let values = values
+                                    .iter()
+                                    .map(|values| values.as_ref())
+                                    .collect::<Vec<_>>();
+                                concat(&values)?
+                            };
+                            Ok(SortColumn {
+                                values,
+                                options: Some(expr.options),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    lexsort_to_indices(&sort_columns, Some(prefix_fetch))?
+                        .values()
+                        .iter()
+                        .map(|idx| *idx as usize)
+                        .collect::<Vec<_>>()
+                } else {
+                    (0..prefix_fetch).collect()
+                };
+
+                interleave_indices.extend(sorted_indices.into_iter().map(|idx| {
+                    let range_idx = offsets.partition_point(|offset| *offset <= idx) - 1;
+                    let prefix_range = &prefix[range_idx];
+                    (
+                        prefix_range.batch_idx,
+                        prefix_range.range.start + idx - offsets[range_idx],
+                    )
+                }));
+                remaining_fetch -= prefix_fetch;
+            }
+
+            if interleave_indices.is_empty() {
+                RecordBatch::new_empty(self.schema())
+            } else {
+                let completed_batches = completed_batches.iter().collect::<Vec<_>>();
+                interleave_record_batch(&completed_batches, &interleave_indices)?
+            }
+        };
+
+        if let Some(remaining_fetch) = self.fetch {
+            self.fetch = Some(remaining_fetch - result.num_rows());
         }
         Ok(result)
     }
 
-    /// Return the end index of the second last partition if the batch
-    /// can be partitioned based on its already sorted columns
-    ///
-    /// Return None if the batch cannot be partitioned, which means the
-    /// batch does not have the information for a safe sort
-    fn get_slice_point(
-        &self,
-        common_prefix_len: usize,
-        batch: &RecordBatch,
-    ) -> Result<Option<usize>> {
-        let common_prefix_sort_keys = (0..common_prefix_len)
+    fn get_prefix_ranges(&self, batch: &RecordBatch) -> Result<Vec<Range<usize>>> {
+        let common_prefix_sort_keys = (0..self.common_prefix_length)
             .map(|idx| self.expr[idx].evaluate_to_sort_column(batch))
             .collect::<Result<Vec<_>>>()?;
-        let partition_points =
-            evaluate_partition_ranges(batch.num_rows(), &common_prefix_sort_keys)?;
-        // If partition points are [0..100], [100..200], [200..300]
-        // we should return 200, which is the safest and furthest partition boundary
-        // Please note that we shouldn't return 300 (which is number of rows in the batch),
-        // because this boundary may change with new data.
-        if partition_points.len() >= 2 {
-            Ok(Some(partition_points[partition_points.len() - 2].end))
-        } else {
-            Ok(None)
-        }
+        evaluate_partition_ranges(batch.num_rows(), &common_prefix_sort_keys)
+    }
+
+    fn prefix_changed_at_batch_boundary(
+        &self,
+        previous_batch: &RecordBatch,
+        batch: &RecordBatch,
+    ) -> Result<bool> {
+        let previous = previous_batch.slice(previous_batch.num_rows() - 1, 1);
+        let next = batch.slice(0, 1);
+        let previous_columns = (0..self.common_prefix_length)
+            .map(|idx| self.expr[idx].evaluate_to_sort_column(&previous))
+            .collect::<Result<Vec<_>>>()?;
+        let next_columns = (0..self.common_prefix_length)
+            .map(|idx| self.expr[idx].evaluate_to_sort_column(&next))
+            .collect::<Result<Vec<_>>>()?;
+        let previous_values = previous_columns
+            .iter()
+            .map(|column| Arc::clone(&column.values))
+            .collect::<Vec<_>>();
+        let next_values = next_columns
+            .iter()
+            .map(|column| Arc::clone(&column.values))
+            .collect::<Vec<_>>();
+        let previous_row = get_row_at_idx(&previous_values, 0)?;
+        let next_row = get_row_at_idx(&next_values, 0)?;
+        let sort_options = self.expr[..self.common_prefix_length]
+            .iter()
+            .map(|expr| expr.options)
+            .collect::<Vec<_>>();
+
+        Ok(compare_rows(&previous_row, &next_row, &sort_options)? != Ordering::Equal)
     }
 }
 

@@ -111,6 +111,11 @@ name = "partial_ordering"
 
 [[bench]]
 harness = false
+name = "partial_sort"
+required-features = ["test_utils"]
+
+[[bench]]
+harness = false
 name = "union_schema"
 
 [[bench]]
