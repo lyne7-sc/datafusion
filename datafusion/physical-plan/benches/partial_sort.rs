@@ -31,44 +31,7 @@ use datafusion_physical_plan::{ExecutionPlan, collect};
 
 const NUM_BATCHES: usize = 32;
 const BATCH_SIZE: usize = 8192;
-const NUM_ROWS: usize = NUM_BATCHES * BATCH_SIZE;
-
-#[derive(Clone, Copy)]
-enum PrefixLayout {
-    BatchesPerPrefix(usize),
-    PrefixesPerBatch(usize),
-    RowsPerPrefix(usize),
-}
-
-impl PrefixLayout {
-    fn prefix_and_suffix(self, batch_idx: usize, row_idx: usize) -> (u64, u64) {
-        match self {
-            Self::BatchesPerPrefix(batches_per_prefix) => {
-                let rows_per_prefix = batches_per_prefix * BATCH_SIZE;
-                let offset = (batch_idx % batches_per_prefix) * BATCH_SIZE + row_idx;
-                (
-                    (batch_idx / batches_per_prefix) as u64,
-                    (rows_per_prefix - offset - 1) as u64,
-                )
-            }
-            Self::PrefixesPerBatch(prefixes_per_batch) => {
-                let rows_per_prefix = BATCH_SIZE / prefixes_per_batch;
-                let prefix_in_batch = row_idx / rows_per_prefix;
-                (
-                    (batch_idx * prefixes_per_batch + prefix_in_batch) as u64,
-                    (rows_per_prefix - row_idx % rows_per_prefix - 1) as u64,
-                )
-            }
-            Self::RowsPerPrefix(rows_per_prefix) => {
-                let global_idx = batch_idx * BATCH_SIZE + row_idx;
-                (
-                    (global_idx / rows_per_prefix) as u64,
-                    (rows_per_prefix - global_idx % rows_per_prefix - 1) as u64,
-                )
-            }
-        }
-    }
-}
+const ROWS_PER_PREFIX: &[usize] = &[100, 1_000, 5_000, 8_192, 10_000, 20_000];
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(
@@ -86,20 +49,20 @@ fn schema() -> SchemaRef {
     ))
 }
 
-fn make_batches(layout: PrefixLayout) -> Vec<RecordBatch> {
+fn make_batches(rows_per_prefix: usize) -> Vec<RecordBatch> {
     let schema = schema();
     (0..NUM_BATCHES)
         .map(|batch_idx| {
-            let rows = 0..BATCH_SIZE;
+            let rows = batch_idx * BATCH_SIZE..(batch_idx + 1) * BATCH_SIZE;
             let prefix = UInt64Array::from_iter_values(
                 rows.clone()
-                    .map(|row_idx| layout.prefix_and_suffix(batch_idx, row_idx).0),
+                    .map(|row_idx| (row_idx / rows_per_prefix) as u64),
             );
-            let suffix = UInt64Array::from_iter_values(
-                rows.clone()
-                    .map(|row_idx| layout.prefix_and_suffix(batch_idx, row_idx).1),
-            );
-            let payload = |row_idx: usize| (batch_idx * BATCH_SIZE + row_idx) as u64;
+            let suffix =
+                UInt64Array::from_iter_values(rows.clone().map(|row_idx| {
+                    (rows_per_prefix - row_idx % rows_per_prefix - 1) as u64
+                }));
+            let payload = |row_idx: usize| row_idx as u64;
             let payload_0 = UInt64Array::from_iter_values(rows.clone().map(payload));
             let payload_1 = UInt64Array::from_iter_values(
                 rows.clone()
@@ -147,53 +110,9 @@ fn partial_sort_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("partial_sort");
     group.sample_size(10);
 
-    let cases = [
-        (
-            BenchmarkId::new("prefix_across_batches", "batches_per_prefix=1"),
-            PrefixLayout::BatchesPerPrefix(1),
-        ),
-        (
-            BenchmarkId::new("prefix_across_batches", "batches_per_prefix=2"),
-            PrefixLayout::BatchesPerPrefix(2),
-        ),
-        (
-            BenchmarkId::new("prefix_across_batches", "batches_per_prefix=4"),
-            PrefixLayout::BatchesPerPrefix(4),
-        ),
-        (
-            BenchmarkId::new("prefixes_within_batch", "prefixes_per_batch=2"),
-            PrefixLayout::PrefixesPerBatch(2),
-        ),
-        (
-            BenchmarkId::new("prefixes_within_batch", "prefixes_per_batch=8"),
-            PrefixLayout::PrefixesPerBatch(8),
-        ),
-        (
-            BenchmarkId::new("prefixes_within_batch", "prefixes_per_batch=32"),
-            PrefixLayout::PrefixesPerBatch(32),
-        ),
-        (
-            BenchmarkId::new("prefixes_within_batch", "prefixes_per_batch=128"),
-            PrefixLayout::PrefixesPerBatch(128),
-        ),
-        (
-            BenchmarkId::new("unaligned_mixed", "rows_per_prefix=1000"),
-            PrefixLayout::RowsPerPrefix(1000),
-        ),
-    ];
-
-    for (id, layout) in cases {
-        let batches = make_batches(layout);
-        let validation = runtime
-            .block_on(collect(make_plan(&batches), Arc::clone(&task_ctx)))
-            .unwrap();
-        assert_eq!(
-            validation.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            NUM_ROWS
-        );
-        drop(validation);
-
-        group.bench_function(id, |b| {
+    for &rows_per_prefix in ROWS_PER_PREFIX {
+        let batches = make_batches(rows_per_prefix);
+        group.bench_function(BenchmarkId::new("rows_per_prefix", rows_per_prefix), |b| {
             b.iter_batched(
                 || make_plan(&batches),
                 |plan| {
