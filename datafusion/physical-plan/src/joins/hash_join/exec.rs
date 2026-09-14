@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1797,98 +1796,51 @@ impl ExecutionPlan for HashJoinExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        // This is the physical-plan equivalent of `push_down_all_join` in
-        // `datafusion/optimizer/src/push_down_filter.rs`. That function uses `lr_is_preserved`
-        // to decide which parent predicates can be pushed past a logical join to its children,
-        // then checks column references to route each predicate to the correct side.
-        //
-        // We apply the same two-level logic here:
-        // 1. `lr_is_preserved` gates whether a side is eligible at all.
-        // 2. For each filter, we check that all column references belong to the
-        //    target child (using `column_indices` to map output column positions
-        //    to join sides). This is critical for correctness: name-based matching
-        //    alone (as done by `ChildFilterDescription::from_child`) can incorrectly
-        //    push filters when different join sides have columns with the same name
-        //    (e.g. nested mark joins both producing "mark" columns).
+        // Preserve the logical join pushdown restrictions, then follow actual
+        // output positions through the embedded projection to the source side.
         let (left_preserved, right_preserved) = lr_is_preserved(self.join_type);
-
-        // Build the set of allowed column indices for each side
-        let column_indices: Vec<ColumnIndex> = match self.projection.as_ref() {
-            Some(projection) => projection
-                .iter()
-                .map(|i| self.column_indices[*i].clone())
-                .collect(),
-            None => self.column_indices.clone(),
-        };
-
-        let (mut left_allowed, mut right_allowed) = (HashSet::new(), HashSet::new());
-        column_indices
-            .iter()
-            .enumerate()
-            .for_each(|(output_idx, ci)| {
-                match ci.side {
-                    JoinSide::Left => left_allowed.insert(output_idx),
-                    JoinSide::Right => right_allowed.insert(output_idx),
-                    // Mark columns - don't allow pushdown to either side
-                    JoinSide::None => false,
+        let map_to_child = |side: JoinSide, preserved: bool| {
+            if !preserved {
+                return Ok(ChildFilterDescription::all_unsupported(&parent_filters));
+            }
+            let schema = match side {
+                JoinSide::Left => self.left.schema(),
+                JoinSide::Right => self.right.schema(),
+                JoinSide::None => unreachable!(),
+            };
+            ChildFilterDescription::from_column_mapping(&parent_filters, |output_index| {
+                let index = match &self.projection {
+                    Some(projection) => *projection.get(output_index)?,
+                    None => output_index,
                 };
-            });
-
-        // For semi joins, filters on output join keys can also be pushed to the
-        // non-output side: every emitted row has an equal key there. This is not
-        // true for anti joins, whose emitted rows have no match.
-        match self.join_type {
-            JoinType::LeftSemi => {
-                let left_key_indices: HashSet<usize> = self
-                    .on
-                    .iter()
-                    .filter_map(|(left_key, _)| {
-                        left_key.downcast_ref::<Column>().map(|c| c.index())
-                    })
-                    .collect();
-                for (output_idx, ci) in column_indices.iter().enumerate() {
-                    if ci.side == JoinSide::Left && left_key_indices.contains(&ci.index) {
-                        right_allowed.insert(output_idx);
-                    }
+                let source = self.column_indices.get(index)?;
+                if source.side == side {
+                    let field = schema.fields().get(source.index)?;
+                    return Some(Arc::new(Column::new(field.name(), source.index)));
                 }
-            }
-            JoinType::RightSemi => {
-                let right_key_indices: HashSet<usize> = self
-                    .on
-                    .iter()
-                    .filter_map(|(_, right_key)| {
-                        right_key.downcast_ref::<Column>().map(|c| c.index())
-                    })
-                    .collect();
-                for (output_idx, ci) in column_indices.iter().enumerate() {
-                    if ci.side == JoinSide::Right && right_key_indices.contains(&ci.index)
-                    {
-                        left_allowed.insert(output_idx);
-                    }
+                // A semi join guarantees a matching key on the non-output side.
+                // Follow the ON expression rather than searching by column name.
+                let propagate_key = matches!(
+                    (self.join_type, source.side, side),
+                    (JoinType::LeftSemi, JoinSide::Left, JoinSide::Right)
+                        | (JoinType::RightSemi, JoinSide::Right, JoinSide::Left)
+                );
+                if !propagate_key {
+                    return None;
                 }
-            }
-            _ => {}
-        }
-
-        let left_child = if left_preserved {
-            ChildFilterDescription::from_child_with_allowed_indices(
-                &parent_filters,
-                left_allowed,
-                self.left(),
-            )?
-        } else {
-            ChildFilterDescription::all_unsupported(&parent_filters)
+                self.on.iter().find_map(|(left, right)| {
+                    let (output_key, child_key) = if side == JoinSide::Right {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    let column = output_key.downcast_ref::<Column>()?;
+                    (column.index() == source.index).then(|| Arc::clone(child_key))
+                })
+            })
         };
-
-        let mut right_child = if right_preserved {
-            ChildFilterDescription::from_child_with_allowed_indices(
-                &parent_filters,
-                right_allowed,
-                self.right(),
-            )?
-        } else {
-            ChildFilterDescription::all_unsupported(&parent_filters)
-        };
+        let left_child = map_to_child(JoinSide::Left, left_preserved)?;
+        let mut right_child = map_to_child(JoinSide::Right, right_preserved)?;
 
         // Add dynamic filters in Post phase if enabled. Skip when this join
         // already carries a dynamic filter from a previous pass — the shared

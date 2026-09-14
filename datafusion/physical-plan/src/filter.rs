@@ -66,7 +66,7 @@ use datafusion_physical_expr::expressions::{
     BinaryExpr, Column, InListExpr, IsNotNullExpr, Literal, lit,
 };
 use datafusion_physical_expr::intervals::utils::check_support;
-use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
+use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{
     AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr, analyze,
     conjunction, split_conjunction,
@@ -304,6 +304,22 @@ impl FilterExec {
     /// The expression to filter on. This expression must evaluate to a boolean value.
     pub fn predicate(&self) -> &Arc<dyn PhysicalExpr> {
         &self.predicate
+    }
+
+    /// Translate parent predicates from this node's output into input coordinates.
+    fn map_parent_filters(
+        &self,
+        parent_filters: &[Arc<dyn PhysicalExpr>],
+    ) -> Result<ChildFilterDescription> {
+        let Some(projection) = &self.projection else {
+            return ChildFilterDescription::from_child(parent_filters, self.input());
+        };
+        let input_schema = self.input.schema();
+        ChildFilterDescription::from_column_mapping(parent_filters, |index| {
+            let input_index = *projection.get(index)?;
+            let field = input_schema.fields().get(input_index)?;
+            Some(Arc::new(Column::new(field.name(), input_index)))
+        })
     }
 
     /// The input plan
@@ -698,18 +714,16 @@ impl ExecutionPlan for FilterExec {
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
         if phase != FilterPushdownPhase::Pre {
-            let child =
-                ChildFilterDescription::from_child(&parent_filters, self.input())?;
+            let child = self.map_parent_filters(&parent_filters)?;
             return Ok(FilterDescription::new().with_child(child));
         }
 
-        let child = ChildFilterDescription::from_child(&parent_filters, self.input())?
-            .with_self_filters(
-                split_conjunction(&self.predicate)
-                    .into_iter()
-                    .cloned()
-                    .collect(),
-            );
+        let child = self.map_parent_filters(&parent_filters)?.with_self_filters(
+            split_conjunction(&self.predicate)
+                .into_iter()
+                .cloned()
+                .collect(),
+        );
 
         Ok(FilterDescription::new().with_child(child))
     }
@@ -724,24 +738,27 @@ impl ExecutionPlan for FilterExec {
             return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
         }
         // We absorb any parent filters that were not handled by our children
-        let mut unsupported_parent_filters: Vec<Arc<dyn PhysicalExpr>> =
-            child_pushdown_result
-                .parent_filters
-                .iter()
-                .filter_map(|f| {
-                    matches!(f.all(), PushedDown::No).then_some(Arc::clone(&f.filter))
-                })
-                .collect();
-
-        // If this FilterExec has a projection, the unsupported parent filters
-        // are in the output schema (after projection) coordinates. We need to
-        // remap them to the input schema coordinates before combining with self filters.
-        if self.projection.is_some() {
-            let input_schema = self.input().schema();
-            unsupported_parent_filters = unsupported_parent_filters
-                .into_iter()
-                .map(|expr| reassign_expr_columns(expr, &input_schema))
-                .collect::<Result<Vec<_>>>()?;
+        let parent_filters = child_pushdown_result
+            .parent_filters
+            .iter()
+            .map(|filter| Arc::clone(&filter.filter))
+            .collect_vec();
+        let mapped = self.map_parent_filters(&parent_filters)?;
+        let mut filters = Vec::with_capacity(parent_filters.len());
+        let mut unsupported_parent_filters = vec![];
+        for (parent, mapped) in child_pushdown_result
+            .parent_filters
+            .iter()
+            .zip(mapped.parent_filters)
+        {
+            if matches!(parent.all(), PushedDown::Yes) {
+                filters.push(PushedDown::Yes);
+            } else {
+                filters.push(mapped.discriminant);
+                if matches!(mapped.discriminant, PushedDown::Yes) {
+                    unsupported_parent_filters.push(mapped.predicate);
+                }
+            }
         }
 
         let unsupported_self_filters = child_pushdown_result
@@ -826,7 +843,7 @@ impl ExecutionPlan for FilterExec {
         };
 
         Ok(FilterPushdownPropagation {
-            filters: vec![PushedDown::Yes; child_pushdown_result.parent_filters.len()],
+            filters,
             updated_node,
         })
     }

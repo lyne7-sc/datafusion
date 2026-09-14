@@ -82,6 +82,297 @@ use super::pushdown_utils::{
 use datafusion_physical_plan::union::UnionExec;
 use object_store::memory::InMemory;
 
+// Column names need not be unique in physical schemas. Make the two columns
+// select different rows so that rebinding the second column by name loses data.
+fn duplicate_column_scan(support: bool) -> Arc<dyn ExecutionPlan> {
+    // File schemas have unique names; duplicate names arise in physical outputs.
+    let batch =
+        record_batch!(("first_id", Int32, [1, 2]), ("id", Int32, [100, 200])).unwrap();
+    let scan = TestScanBuilder::new(batch.schema())
+        .with_support(support)
+        .with_batches(vec![batch])
+        .build();
+    Arc::new(
+        ProjectionExec::try_new(
+            vec![
+                (
+                    Arc::new(Column::new("first_id", 0)) as Arc<dyn PhysicalExpr>,
+                    "id".to_string(),
+                ),
+                (Arc::new(Column::new("id", 1)) as _, "id".to_string()),
+            ],
+            scan,
+        )
+        .unwrap(),
+    )
+}
+
+fn indexed_eq(name: &str, index: usize, value: i32) -> Arc<dyn PhysicalExpr> {
+    Arc::new(BinaryExpr::new(
+        Arc::new(Column::new(name, index)),
+        Operator::Eq,
+        Arc::new(Literal::new(ScalarValue::Int32(Some(value)))),
+    ))
+}
+
+async fn check_column_mapping(plan: Arc<dyn ExecutionPlan>, expected_predicate: &str) {
+    let mut config = ConfigOptions::default();
+    config.execution.parquet.pushdown_filters = true;
+    let ctx = SessionContext::new();
+    ctx.register_object_store(
+        ObjectStoreUrl::parse("test://").unwrap().as_ref(),
+        Arc::new(InMemory::new()),
+    );
+    let expected = collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap();
+    assert_eq!(expected.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let plan = datafusion_physical_plan::execution_plan::reset_plan_states(plan).unwrap();
+    let optimized = FilterPushdown::new().optimize(plan, &config).unwrap();
+    let formatted = format_plan_for_test(&optimized);
+    let actual = collect(optimized, ctx.task_ctx()).await.unwrap();
+    assert_eq!(
+        pretty_format_batches(&actual).unwrap().to_string(),
+        pretty_format_batches(&expected).unwrap().to_string(),
+        "{formatted}",
+    );
+    assert!(formatted.contains(expected_predicate), "{formatted}");
+}
+
+// SQL covers computed projections; construct duplicate output aliases here to
+// verify that each output index selects its own expression.
+#[test]
+fn test_column_mapping_projection() {
+    use datafusion_physical_plan::filter_pushdown::{FilterPushdownPhase, PushedDown};
+
+    let projection = ProjectionExec::try_new(
+        vec![
+            (
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("id", 1)),
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                )) as Arc<dyn PhysicalExpr>,
+                "id".to_string(),
+            ),
+            (Arc::new(Column::new("id", 0)) as _, "id".to_string()),
+        ],
+        duplicate_column_scan(true),
+    )
+    .unwrap();
+    let description = projection
+        .gather_filters_for_pushdown(
+            FilterPushdownPhase::Post,
+            vec![indexed_eq("id", 0, 101), indexed_eq("id", 1, 1)],
+            &ConfigOptions::default(),
+        )
+        .unwrap();
+    let parents = description.parent_filters();
+    for (filter, expected) in parents[0].iter().zip(["id@1 + 1 = 101", "id@0 = 1"]) {
+        assert!(matches!(filter.discriminant, PushedDown::Yes));
+        assert_eq!(filter.predicate.to_string(), expected);
+    }
+}
+
+// Unlike the post-phase SQL cases, this exercises FilterExec absorbing a
+// rejected parent filter in the pre phase, using input coordinates.
+#[tokio::test]
+async fn test_column_mapping_filter_projection_absorbs_rejected_parent() {
+    let input = Arc::new(
+        FilterExecBuilder::new(
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+            duplicate_column_scan(false),
+        )
+        .apply_projection(Some(vec![1, 0]))
+        .unwrap()
+        .build()
+        .unwrap(),
+    );
+    let plan = Arc::new(FilterExec::try_new(indexed_eq("id", 0, 100), input).unwrap());
+    check_column_mapping(plan, "FilterExec: id@1 = 100").await;
+}
+
+// Build ON expressions directly so the SQL optimizer cannot extract the
+// computed key into a ProjectionExec and leave only columns in HashJoinExec.
+#[tokio::test]
+async fn test_column_mapping_semi_join_computed_keys() {
+    use datafusion_physical_plan::filter_pushdown::{FilterPushdownPhase, PushedDown};
+
+    for join_type in [JoinType::LeftSemi, JoinType::RightSemi] {
+        for computed_output_key in [false, true] {
+            let output = record_batch!(("id", Int32, [100, 200])).unwrap();
+            let keys = if computed_output_key {
+                vec![101, 201]
+            } else {
+                vec![99, 199]
+            };
+            let other =
+                record_batch!(("id", Int32, [1, 2]), ("key", Int32, keys)).unwrap();
+            let output = TestScanBuilder::new(output.schema())
+                .with_support(true)
+                .with_batches(vec![output])
+                .build();
+            let other = TestScanBuilder::new(other.schema())
+                .with_support(true)
+                .with_batches(vec![other])
+                .build();
+            let add_one = |expr: Arc<dyn PhysicalExpr>| -> Arc<dyn PhysicalExpr> {
+                Arc::new(BinaryExpr::new(
+                    expr,
+                    Operator::Plus,
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                ))
+            };
+            let mut output_key = Arc::new(Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+            let mut other_key = Arc::new(Column::new("key", 1)) as Arc<dyn PhysicalExpr>;
+            if computed_output_key {
+                output_key = add_one(output_key);
+            } else {
+                other_key = add_one(other_key);
+            }
+            let (left, right, on, output_side, other_side) =
+                if join_type == JoinType::LeftSemi {
+                    (output, other, vec![(output_key, other_key)], 0, 1)
+                } else {
+                    (other, output, vec![(other_key, output_key)], 1, 0)
+                };
+            let join = Arc::new(
+                HashJoinExec::try_new(
+                    left,
+                    right,
+                    on,
+                    None,
+                    &join_type,
+                    None,
+                    PartitionMode::CollectLeft,
+                    datafusion_common::NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .unwrap(),
+            );
+            let filter = indexed_eq("id", 0, 100);
+            let description = join
+                .gather_filters_for_pushdown(
+                    FilterPushdownPhase::Pre,
+                    vec![Arc::clone(&filter)],
+                    &ConfigOptions::default(),
+                )
+                .unwrap();
+            let parents = description.parent_filters();
+            assert!(matches!(
+                parents[output_side][0].discriminant,
+                PushedDown::Yes
+            ));
+            let mapped = &parents[other_side][0];
+            if computed_output_key {
+                // id + 1 = key does not identify an equivalent expression for
+                // the original output column id. Do not propagate id = 100.
+                assert!(matches!(mapped.discriminant, PushedDown::No));
+                assert!(Arc::ptr_eq(&mapped.predicate, &filter));
+            } else {
+                // id = key + 1 allows the full computed expression to replace id.
+                assert!(matches!(mapped.discriminant, PushedDown::Yes));
+                assert_eq!(mapped.predicate.to_string(), "key@1 + 1 = 100");
+            }
+            let plan = Arc::new(FilterExec::try_new(filter, join).unwrap());
+            check_column_mapping(
+                plan,
+                if computed_output_key {
+                    "predicate=id@0 = 100"
+                } else {
+                    "predicate=key@1 + 1 = 100"
+                },
+            )
+            .await;
+        }
+    }
+}
+
+#[test]
+fn test_column_mapping_computed_group_rejects_parent() {
+    use datafusion_physical_plan::filter_pushdown::{FilterPushdownPhase, PushedDown};
+
+    let input = duplicate_column_scan(true);
+    let schema = input.schema();
+    let expr = Arc::new(BinaryExpr::new(
+        Arc::new(Column::new("id", 1)),
+        Operator::Plus,
+        Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+    ));
+    let aggregate = AggregateExec::try_new(
+        AggregateMode::Single,
+        PhysicalGroupBy::new_single(vec![(expr, "id".to_string())]),
+        vec![],
+        vec![],
+        input,
+        schema,
+    )
+    .unwrap();
+    let filter = indexed_eq("id", 0, 101);
+    let description = aggregate
+        .gather_filters_for_pushdown(
+            FilterPushdownPhase::Pre,
+            vec![Arc::clone(&filter)],
+            &ConfigOptions::default(),
+        )
+        .unwrap();
+    let parents = description.parent_filters();
+    assert!(matches!(parents[0][0].discriminant, PushedDown::No));
+    assert!(Arc::ptr_eq(&parents[0][0].predicate, &filter));
+}
+
+#[test]
+fn test_column_mapping_rejects_unmappable_predicate() {
+    use datafusion_physical_plan::filter_pushdown::{FilterPushdownPhase, PushedDown};
+
+    let scan = duplicate_column_scan(true);
+    let projection = ProjectionExec::try_new(
+        vec![(
+            Arc::new(Column::new("id", 1)) as Arc<dyn PhysicalExpr>,
+            "id".to_string(),
+        )],
+        scan,
+    )
+    .unwrap();
+    // Mapping the first reference succeeds, but the second is outside the output.
+    // Returning the partially rewritten predicate would mix two schemas.
+    let filter = conjunction(vec![indexed_eq("id", 0, 100), indexed_eq("id", 2, 1)]);
+    let description = projection
+        .gather_filters_for_pushdown(
+            FilterPushdownPhase::Post,
+            vec![Arc::clone(&filter)],
+            &ConfigOptions::default(),
+        )
+        .unwrap();
+    let parents = description.parent_filters();
+    assert!(matches!(parents[0][0].discriminant, PushedDown::No));
+    assert!(Arc::ptr_eq(&parents[0][0].predicate, &filter));
+}
+
+#[test]
+fn test_column_mapping_identity_validation() {
+    use datafusion_physical_plan::filter_pushdown::{FilterPushdownPhase, PushedDown};
+
+    let scan = duplicate_column_scan(true);
+    let repartition =
+        RepartitionExec::try_new(scan, Partitioning::RoundRobinBatch(2)).unwrap();
+    let filters = vec![
+        indexed_eq("id", 1, 100),
+        indexed_eq("id", 2, 100),
+        indexed_eq("other", 0, 100),
+    ];
+    let description = repartition
+        .gather_filters_for_pushdown(
+            FilterPushdownPhase::Post,
+            filters.clone(),
+            &ConfigOptions::default(),
+        )
+        .unwrap();
+    let parents = description.parent_filters();
+    for (index, (parent, original)) in parents[0].iter().zip(&filters).enumerate() {
+        assert_eq!(matches!(parent.discriminant, PushedDown::Yes), index == 0);
+        assert!(Arc::ptr_eq(&parent.predicate, original));
+    }
+}
+
 #[test]
 fn test_pushdown_into_scan() {
     let scan = TestScanBuilder::new(schema()).with_support(true).build();

@@ -178,7 +178,9 @@ use crate::{
 };
 use datafusion_common::config::ConfigOptions;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 
 use arrow::array::{ArrayRef, UInt8Array, UInt16Array, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -2267,16 +2269,6 @@ impl ExecutionPlan for AggregateExec {
         // This optimization is NOT safe for filters on aggregated columns (like filtering on
         // the result of SUM or COUNT), as those require computing all groups first.
 
-        // Grouping columns are output before aggregate columns, in the same order
-        // as the grouping expressions. A grouping-set null mask marks grouping
-        // columns that are not available in that set.
-        let mut allowed_indices: HashSet<usize> =
-            (0..self.group_by.expr().len()).collect();
-        for null_mask in self.group_by.groups() {
-            allowed_indices.retain(|idx| null_mask.get(*idx) != Some(&true));
-        }
-
-        let child = self.children()[0];
         // Global aggregates and grouping sets containing an empty grouping set
         // emit a row even when their input is empty. Parent filters therefore
         // cannot be pushed below them, including filters without column
@@ -2290,11 +2282,20 @@ impl ExecutionPlan for AggregateExec {
         let mut child_desc = if may_emit_on_empty_input {
             ChildFilterDescription::all_unsupported(&parent_filters)
         } else {
-            ChildFilterDescription::from_child_with_allowed_indices(
-                &parent_filters,
-                allowed_indices,
-                child,
-            )?
+            ChildFilterDescription::from_column_mapping(&parent_filters, |index| {
+                // Grouping expressions precede aggregate results in the output.
+                let (expr, _) = self.group_by.expr().get(index)?;
+                if !expr.is::<Column>()
+                    || self
+                        .group_by
+                        .groups()
+                        .iter()
+                        .any(|mask| mask.get(index) == Some(&true))
+                {
+                    return None;
+                }
+                Some(Arc::clone(expr))
+            })?
         };
 
         // Include self dynamic filter when it's possible

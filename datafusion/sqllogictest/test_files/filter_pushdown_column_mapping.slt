@@ -1,0 +1,326 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Physical filters must follow column positions through duplicate names.
+# Keep the nested join tree; use default partition and batch settings.
+statement ok
+SET datafusion.optimizer.join_reordering = false;
+
+statement ok
+SET datafusion.execution.parquet.pushdown_filters = true;
+
+statement ok
+SET datafusion.explain.physical_plan_only = true;
+
+query I
+COPY (SELECT 1::INT AS id, 7::INT AS k) TO 'test_files/scratch/filter_pushdown_column_mapping/a.parquet' STORED AS PARQUET;
+----
+1
+
+statement ok
+CREATE EXTERNAL TABLE a STORED AS PARQUET LOCATION 'test_files/scratch/filter_pushdown_column_mapping/a.parquet';
+
+query I
+COPY (SELECT 100::INT AS id, 7::INT AS k) TO 'test_files/scratch/filter_pushdown_column_mapping/b.parquet' STORED AS PARQUET;
+----
+1
+
+statement ok
+CREATE EXTERNAL TABLE b STORED AS PARQUET LOCATION 'test_files/scratch/filter_pushdown_column_mapping/b.parquet';
+
+query I
+COPY (SELECT 100::INT AS key) TO 'test_files/scratch/filter_pushdown_column_mapping/c.parquet' STORED AS PARQUET;
+----
+1
+
+statement ok
+CREATE EXTERNAL TABLE c STORED AS PARQUET LOCATION 'test_files/scratch/filter_pushdown_column_mapping/c.parquet';
+
+query I
+COPY (SELECT 101::INT AS key) TO 'test_files/scratch/filter_pushdown_column_mapping/d.parquet' STORED AS PARQUET;
+----
+1
+
+statement ok
+CREATE EXTERNAL TABLE d STORED AS PARQUET LOCATION 'test_files/scratch/filter_pushdown_column_mapping/d.parquet';
+
+# Nested join and Repartition
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = true;
+
+query TT
+EXPLAIN SELECT a.id AS a_id, b.id AS b_id FROM c LEFT JOIN (a JOIN b ON a.k = b.k) ON c.key = b.id;
+----
+physical_plan
+01)ProjectionExec: expr=[id@0 as a_id, id@1 as b_id]
+02)--HashJoinExec: mode=CollectLeft, join_type=Left, on=[(key@0, id@1)], projection=[id@1, id@2]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/c.parquet]]}, projection=[key], file_type=parquet
+04)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+05)------HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(k@1, k@1)], projection=[id@0, id@2]
+06)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/a.parquet]]}, projection=[id, k], file_type=parquet
+07)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/b.parquet]]}, projection=[id, k], file_type=parquet, predicate=DynamicFilter [ empty ] AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+
+query II
+SELECT a.id AS a_id, b.id AS b_id FROM c LEFT JOIN (a JOIN b ON a.k = b.k) ON c.key = b.id;
+----
+1 100
+
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = false;
+
+query II
+SELECT a.id AS a_id, b.id AS b_id FROM c LEFT JOIN (a JOIN b ON a.k = b.k) ON c.key = b.id;
+----
+1 100
+
+# Projection with computation
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = true;
+
+query TT
+EXPLAIN SELECT x.id, x.a_id FROM d JOIN (SELECT b.id + 1 AS id, a.id AS a_id FROM a JOIN b ON a.k = b.k) x ON d.key = x.id;
+----
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(CAST(d.key AS Int64)@1, id@0)], projection=[id@2, a_id@3]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/d.parquet]]}, projection=[key, CAST(key@0 AS Int64) as CAST(d.key AS Int64)], file_type=parquet
+03)--ProjectionExec: expr=[CAST(id@2 AS Int64) + 1 as id, id@0 as a_id]
+04)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+05)------HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(k@1, k@1)]
+06)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/a.parquet]]}, projection=[id, k], file_type=parquet
+07)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/b.parquet]]}, projection=[id, k], file_type=parquet, predicate=DynamicFilter [ empty ] AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+
+query II
+SELECT x.id, x.a_id FROM d JOIN (SELECT b.id + 1 AS id, a.id AS a_id FROM a JOIN b ON a.k = b.k) x ON d.key = x.id;
+----
+101 1
+
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = false;
+
+query II
+SELECT x.id, x.a_id FROM d JOIN (SELECT b.id + 1 AS id, a.id AS a_id FROM a JOIN b ON a.k = b.k) x ON d.key = x.id;
+----
+101 1
+
+# Filter with an embedded projection. The predicate needs a.k, which is not
+# selected, so FilterExec retains it in its input and projects [id@0, id@2].
+# The parent filter on b_id@1 must therefore map to the input column id@2.
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = true;
+
+query TT
+EXPLAIN SELECT x.a_id, x.b_id FROM c LEFT JOIN (SELECT a.id AS a_id, b.id AS b_id FROM a LEFT JOIN b ON a.k = b.k WHERE a.k > 0 OR b.id > 0) x ON c.key = x.b_id;
+----
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Left, on=[(key@0, b_id@1)], projection=[a_id@1, b_id@2]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/c.parquet]]}, projection=[key], file_type=parquet
+03)--ProjectionExec: expr=[id@0 as a_id, id@1 as b_id]
+04)----FilterExec: k@1 > 0 OR id@2 > 0, projection=[id@0, id@2]
+05)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+06)--------HashJoinExec: mode=CollectLeft, join_type=Left, on=[(k@1, k@1)], projection=[id@0, k@1, id@2]
+07)----------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/a.parquet]]}, projection=[id, k], file_type=parquet
+08)----------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/b.parquet]]}, projection=[id, k], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+
+query II
+SELECT x.a_id, x.b_id FROM c LEFT JOIN (SELECT a.id AS a_id, b.id AS b_id FROM a LEFT JOIN b ON a.k = b.k WHERE a.k > 0 OR b.id > 0) x ON c.key = x.b_id;
+----
+1 100
+
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = false;
+
+query II
+SELECT x.a_id, x.b_id FROM c LEFT JOIN (SELECT a.id AS a_id, b.id AS b_id FROM a LEFT JOIN b ON a.k = b.k WHERE a.k > 0 OR b.id > 0) x ON c.key = x.b_id;
+----
+1 100
+
+# Aggregate grouping column alias
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = true;
+
+query TT
+EXPLAIN SELECT x.id, x.a_id FROM c JOIN (SELECT b.id AS id, a.id AS a_id FROM a JOIN b ON a.k = b.k GROUP BY b.id, a.id) x ON c.key = x.id;
+----
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, id@0)], projection=[id@1, a_id@2]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/c.parquet]]}, projection=[key], file_type=parquet
+03)--ProjectionExec: expr=[id@0 as id, id@1 as a_id]
+04)----AggregateExec: mode=FinalPartitioned, gby=[id@0 as id, id@1 as id], aggr=[]
+05)------RepartitionExec: partitioning=Hash([id@0, id@1], 4), input_partitions=4
+06)--------AggregateExec: mode=Partial, gby=[id@1 as id, id@0 as id], aggr=[]
+07)----------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+08)------------HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(k@1, k@1)], projection=[id@0, id@2]
+09)--------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/a.parquet]]}, projection=[id, k], file_type=parquet
+10)--------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/b.parquet]]}, projection=[id, k], file_type=parquet, predicate=DynamicFilter [ empty ] AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+
+query II
+SELECT x.id, x.a_id FROM c JOIN (SELECT b.id AS id, a.id AS a_id FROM a JOIN b ON a.k = b.k GROUP BY b.id, a.id) x ON c.key = x.id;
+----
+100 1
+
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = false;
+
+query II
+SELECT x.id, x.a_id FROM c JOIN (SELECT b.id AS id, a.id AS a_id FROM a JOIN b ON a.k = b.k GROUP BY b.id, a.id) x ON c.key = x.id;
+----
+100 1
+
+# Dynamic predicate referring to both join sides
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = true;
+
+query TT
+EXPLAIN SELECT a.id AS a_id, b.id AS b_id FROM d LEFT JOIN (a JOIN b ON a.k = b.k) ON d.key = a.id + b.id;
+----
+physical_plan
+01)ProjectionExec: expr=[id@0 as a_id, id@1 as b_id]
+02)--HashJoinExec: mode=CollectLeft, join_type=Left, on=[(key@0, a.id + b.id@2)], projection=[id@1, id@2]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/d.parquet]]}, projection=[key], file_type=parquet
+04)----ProjectionExec: expr=[id@0 as id, id@1 as id, id@0 + id@1 as a.id + b.id]
+05)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+06)--------HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(k@1, k@1)], projection=[id@0, id@2]
+07)----------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/a.parquet]]}, projection=[id, k], file_type=parquet
+08)----------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/b.parquet]]}, projection=[id, k], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+
+query II
+SELECT a.id AS a_id, b.id AS b_id FROM d LEFT JOIN (a JOIN b ON a.k = b.k) ON d.key = a.id + b.id;
+----
+1 100
+
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = false;
+
+query II
+SELECT a.id AS a_id, b.id AS b_id FROM d LEFT JOIN (a JOIN b ON a.k = b.k) ON d.key = a.id + b.id;
+----
+1 100
+
+# Keep both z columns in a real scan: the residual join condition needs z.id,
+# while the equijoin uses z.key. Their different values expose name-based remapping.
+query I
+COPY (SELECT 0::INT AS id, 1::INT AS key) TO 'test_files/scratch/filter_pushdown_column_mapping/z.parquet' STORED AS PARQUET;
+----
+1
+
+statement ok
+CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION 'test_files/scratch/filter_pushdown_column_mapping/z.parquet';
+
+# Left semi join with a differently named key
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = true;
+
+query TT
+EXPLAIN SELECT c.key, x.id FROM c JOIN (SELECT a.id FROM a LEFT SEMI JOIN z ON a.id = z.key AND z.id < a.k) x ON c.key = x.id + 99;
+----
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(CAST(c.key AS Int64)@1, x.id + Int64(99)@1)], projection=[key@0, id@2]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/c.parquet]]}, projection=[key, CAST(key@0 AS Int64) as CAST(c.key AS Int64)], file_type=parquet
+03)--ProjectionExec: expr=[id@0 as id, CAST(id@0 AS Int64) + 99 as x.id + Int64(99)]
+04)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+05)------HashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(id@0, key@1)], filter=id@1 < k@0, projection=[id@0]
+06)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/a.parquet]]}, projection=[id, k], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+07)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/z.parquet]]}, projection=[id, key], file_type=parquet, predicate=DynamicFilter [ empty ] AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+
+query II
+SELECT c.key, x.id FROM c JOIN (SELECT a.id FROM a LEFT SEMI JOIN z ON a.id = z.key AND z.id < a.k) x ON c.key = x.id + 99;
+----
+100 1
+
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = false;
+
+query II
+SELECT c.key, x.id FROM c JOIN (SELECT a.id FROM a LEFT SEMI JOIN z ON a.id = z.key AND z.id < a.k) x ON c.key = x.id + 99;
+----
+100 1
+
+# Right semi join with a differently named key
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = true;
+
+query TT
+EXPLAIN SELECT c.key, x.id FROM c JOIN (SELECT a.id FROM z RIGHT SEMI JOIN a ON z.key = a.id AND z.id < a.k) x ON c.key = x.id + 99;
+----
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(CAST(c.key AS Int64)@1, x.id + Int64(99)@1)], projection=[key@0, id@2]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/c.parquet]]}, projection=[key, CAST(key@0 AS Int64) as CAST(c.key AS Int64)], file_type=parquet
+03)--ProjectionExec: expr=[id@0 as id, CAST(id@0 AS Int64) + 99 as x.id + Int64(99)]
+04)----RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+05)------HashJoinExec: mode=CollectLeft, join_type=RightSemi, on=[(key@1, id@0)], filter=id@0 < k@1, projection=[id@0]
+06)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/z.parquet]]}, projection=[id, key], file_type=parquet, predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+07)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/a.parquet]]}, projection=[id, k], file_type=parquet, predicate=DynamicFilter [ empty ] AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+
+query II
+SELECT c.key, x.id FROM c JOIN (SELECT a.id FROM z RIGHT SEMI JOIN a ON z.key = a.id AND z.id < a.k) x ON c.key = x.id + 99;
+----
+100 1
+
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = false;
+
+query II
+SELECT c.key, x.id FROM c JOIN (SELECT a.id FROM z RIGHT SEMI JOIN a ON z.key = a.id AND z.id < a.k) x ON c.key = x.id + 99;
+----
+100 1
+
+# A parent dynamic filter must cross two joins with reordered output columns.
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = true;
+
+query TT
+EXPLAIN SELECT y.a_id, y.b_id FROM d JOIN (SELECT x.a_id, x.b_id FROM c JOIN (SELECT b.id AS b_id, a.id AS a_id FROM a JOIN b ON a.k = b.k) x ON c.key = x.b_id) y ON d.key = y.b_id + 1;
+----
+physical_plan
+01)HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(CAST(d.key AS Int64)@1, y.b_id + Int64(1)@2)], projection=[a_id@2, b_id@3]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/d.parquet]]}, projection=[key, CAST(key@0 AS Int64) as CAST(d.key AS Int64)], file_type=parquet
+03)--ProjectionExec: expr=[a_id@0 as a_id, b_id@1 as b_id, CAST(b_id@1 AS Int64) + 1 as y.b_id + Int64(1)]
+04)----HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, b_id@0)], projection=[a_id@2, b_id@1]
+05)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/c.parquet]]}, projection=[key], file_type=parquet
+06)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+07)--------ProjectionExec: expr=[id@0 as b_id, id@1 as a_id]
+08)----------HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(k@1, k@1)], projection=[id@2, id@0]
+09)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/a.parquet]]}, projection=[id, k], file_type=parquet
+10)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/filter_pushdown_column_mapping/b.parquet]]}, projection=[id, k], file_type=parquet, predicate=DynamicFilter [ empty ] AND DynamicFilter [ empty ] AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+
+query II
+SELECT y.a_id, y.b_id FROM d JOIN (SELECT x.a_id, x.b_id FROM c JOIN (SELECT b.id AS b_id, a.id AS a_id FROM a JOIN b ON a.k = b.k) x ON c.key = x.b_id) y ON d.key = y.b_id + 1;
+----
+1 100
+
+statement ok
+SET datafusion.optimizer.enable_dynamic_filter_pushdown = false;
+
+query II
+SELECT y.a_id, y.b_id FROM d JOIN (SELECT x.a_id, x.b_id FROM c JOIN (SELECT b.id AS b_id, a.id AS a_id FROM a JOIN b ON a.k = b.k) x ON c.key = x.b_id) y ON d.key = y.b_id + 1;
+----
+1 100
+
+statement ok
+RESET datafusion.optimizer.join_reordering;
+
+statement ok
+RESET datafusion.optimizer.enable_dynamic_filter_pushdown;
+
+statement ok
+RESET datafusion.optimizer.enable_aggregate_dynamic_filter_pushdown;
+
+statement ok
+RESET datafusion.execution.parquet.pushdown_filters;
+
+statement ok
+RESET datafusion.explain.physical_plan_only;
