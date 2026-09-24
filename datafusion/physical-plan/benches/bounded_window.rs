@@ -23,7 +23,8 @@
 //! live partition on every batch while never retiring partitions until the
 //! input is exhausted. The cases here stress that path in different ways.
 //!
-//! Case names spell out the input order mode (`linear` / `sorted`), the key
+//! Case names spell out the input order mode (`linear` / `partially_sorted` /
+//! `sorted`), the key
 //! layout (`dense` / `sparse`), the window functions, an optional frame
 //! variant, and the partition count:
 //!
@@ -46,6 +47,10 @@
 //! - `linear sparse lead N partitions`: the sparse layout with a non-causal
 //!   function, whose result for the last buffered row of a partition stays
 //!   pending until that partition receives another row.
+//! - `linear dense row_number Utf8/Utf8View 16 bytes N partitions`: repeated
+//!   lookups of string partition keys, with cheap window evaluation.
+//! - `partially_sorted row_number Utf8/Utf8View 16 bytes 100 partitions per prefix`:
+//!   a sorted prefix spans several batches while string keys remain interleaved.
 //! - `linear dense rank N partitions`: the dense layout with an evaluator
 //!   that compares ORDER BY values row by row.
 //! - `sorted count N partitions`: control; input sorted by partition key,
@@ -54,7 +59,8 @@
 
 use std::sync::Arc;
 
-use arrow::array::UInt64Array;
+use arrow::array::{ArrayRef, StringArray, UInt64Array};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -122,6 +128,54 @@ fn sparse_batches() -> Vec<RecordBatch> {
     })
 }
 
+/// Round-robin partitions with 16-byte string keys. Utf8View keys exceed the
+/// 12-byte inline capacity, so extracting a ScalarValue copies their contents.
+fn string_batches(n_partitions: usize, key_type: DataType) -> Vec<RecordBatch> {
+    let keys: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..BATCH_SIZE * N_BATCHES).map(|i| format!("{:016}", i % n_partitions)),
+    ));
+    let keys = cast(&keys, &key_type).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("pk", key_type, false),
+        Field::new("ts", DataType::UInt64, false),
+    ]));
+    (0..N_BATCHES)
+        .map(|batch| {
+            let start = batch * BATCH_SIZE;
+            let ts = UInt64Array::from_iter_values(
+                (start..start + BATCH_SIZE).map(|i| i as u64),
+            );
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![keys.slice(start, BATCH_SIZE), Arc::new(ts)],
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// Add a sorted partition-key prefix to the existing string data. Each prefix
+/// spans several batches and ends inside a batch, exercising partition retirement.
+fn partially_sorted_string_batches(key_type: DataType) -> Vec<RecordBatch> {
+    let batches = string_batches(100, key_type);
+    let mut fields = batches[0].schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("prefix", DataType::UInt64, false)));
+    let schema = Arc::new(Schema::new(fields));
+    batches
+        .into_iter()
+        .enumerate()
+        .map(|(batch_idx, batch)| {
+            let start = batch_idx * BATCH_SIZE;
+            let prefix = UInt64Array::from_iter_values(
+                (start..start + BATCH_SIZE).map(|i| (i / (4 * BATCH_SIZE + 17)) as u64),
+            );
+            let mut columns = batch.columns().to_vec();
+            columns.push(Arc::new(prefix));
+            RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
+        })
+        .collect()
+}
+
 /// Input laid out partition-by-partition (the `Sorted` layout).
 fn sorted_batches(n_partitions: usize) -> Vec<RecordBatch> {
     let rows_per_partition = BATCH_SIZE * N_BATCHES / n_partitions;
@@ -166,22 +220,26 @@ type BenchWindowFn = (
     Vec<Arc<dyn PhysicalExpr>>,
 );
 
-/// `<fn>(<args>) OVER (PARTITION BY pk ORDER BY ts <window_frame>)` for each
+/// `<fn>(<args>) OVER (PARTITION BY <partition_by> ORDER BY ts <window_frame>)` for each
 /// window function in `functions`.
 fn window_exec(
     batches: Vec<RecordBatch>,
     mode: InputOrderMode,
+    partition_by: &[&str],
     input_ordering: Vec<PhysicalSortExpr>,
     window_frame: &WindowFrame,
     functions: &[BenchWindowFn],
 ) -> Arc<dyn ExecutionPlan> {
-    let schema = schema();
+    let schema = batches[0].schema();
     let source = TestMemoryExec::try_new(&[batches], Arc::clone(&schema), None)
         .expect("memory exec")
         .try_with_sort_information(LexOrdering::new(input_ordering).into_iter().collect())
         .expect("sort information");
     let input = Arc::new(TestMemoryExec::update_cache(&Arc::new(source)));
-    let partitionby_exprs = vec![col("pk", &schema).unwrap()];
+    let partitionby_exprs = partition_by
+        .iter()
+        .map(|name| col(name, &schema).unwrap())
+        .collect::<Vec<_>>();
     let orderby_exprs = vec![PhysicalSortExpr {
         expr: col("ts", &schema).unwrap(),
         options: Default::default(),
@@ -280,6 +338,7 @@ fn bounded_window_benchmark(c: &mut Criterion) {
             window_exec(
                 dense_batches(n_partitions),
                 InputOrderMode::Linear,
+                &["pk"],
                 vec![sort_expr("ts")],
                 &range_frame(),
                 &[count()],
@@ -295,6 +354,7 @@ fn bounded_window_benchmark(c: &mut Criterion) {
         window_exec(
             sparse_batches(),
             InputOrderMode::Linear,
+            &["pk"],
             vec![sort_expr("ts")],
             &range_frame(),
             &[count()],
@@ -306,6 +366,7 @@ fn bounded_window_benchmark(c: &mut Criterion) {
         window_exec(
             dense_batches(10_000),
             InputOrderMode::Linear,
+            &["pk"],
             vec![sort_expr("ts")],
             &rows_frame(),
             &[count()],
@@ -317,22 +378,26 @@ fn bounded_window_benchmark(c: &mut Criterion) {
         window_exec(
             dense_batches(10_000),
             InputOrderMode::Linear,
+            &["pk"],
             vec![sort_expr("ts")],
             &range_frame(),
             &[count(), sum()],
         ),
     );
 
-    run_case(
-        "linear dense row_number 10000 partitions".to_string(),
-        window_exec(
-            dense_batches(10_000),
-            InputOrderMode::Linear,
-            vec![sort_expr("ts")],
-            &default_frame(),
-            &[row_number()],
-        ),
-    );
+    for n_partitions in [100, 10_000] {
+        run_case(
+            format!("linear dense row_number {n_partitions} partitions"),
+            window_exec(
+                dense_batches(n_partitions),
+                InputOrderMode::Linear,
+                &["pk"],
+                vec![sort_expr("ts")],
+                &default_frame(),
+                &[row_number()],
+            ),
+        );
+    }
 
     run_case(
         format!(
@@ -342,6 +407,7 @@ fn bounded_window_benchmark(c: &mut Criterion) {
         window_exec(
             sparse_batches(),
             InputOrderMode::Linear,
+            &["pk"],
             vec![sort_expr("ts")],
             &default_frame(),
             &[row_number()],
@@ -356,6 +422,7 @@ fn bounded_window_benchmark(c: &mut Criterion) {
         window_exec(
             sparse_batches(),
             InputOrderMode::Linear,
+            &["pk"],
             vec![sort_expr("ts")],
             &default_frame(),
             &[lead()],
@@ -367,11 +434,56 @@ fn bounded_window_benchmark(c: &mut Criterion) {
         window_exec(
             dense_batches(10_000),
             InputOrderMode::Linear,
+            &["pk"],
             vec![sort_expr("ts")],
             &default_frame(),
             &[rank()],
         ),
     );
+
+    // Cheap window evaluation exposes repeated partition-key lookup costs.
+    for (key_type, n_partitions) in [
+        (DataType::Utf8, 100),
+        (DataType::Utf8View, 100),
+        (DataType::Utf8, 10_000),
+    ] {
+        run_case(
+            format!(
+                "linear dense row_number {key_type} 16 bytes {n_partitions} partitions"
+            ),
+            window_exec(
+                string_batches(n_partitions, key_type),
+                InputOrderMode::Linear,
+                &["pk"],
+                vec![sort_expr("ts")],
+                &default_frame(),
+                &[row_number()],
+            ),
+        );
+    }
+
+    for key_type in [DataType::Utf8, DataType::Utf8View] {
+        let name = format!(
+            "partially_sorted row_number {key_type} 16 bytes 100 partitions per prefix"
+        );
+        let batches = partially_sorted_string_batches(key_type);
+        let schema = batches[0].schema();
+        let ordering = ["prefix", "ts"]
+            .into_iter()
+            .map(|name| PhysicalSortExpr::new_default(col(name, &schema).unwrap()))
+            .collect();
+        run_case(
+            name,
+            window_exec(
+                batches,
+                InputOrderMode::PartiallySorted(vec![1]),
+                &["pk", "prefix"],
+                ordering,
+                &default_frame(),
+                &[row_number()],
+            ),
+        );
+    }
 
     // Control: the same query over partition-sorted input, where finished
     // partitions are pruned eagerly and the state maps stay small.
@@ -380,6 +492,7 @@ fn bounded_window_benchmark(c: &mut Criterion) {
         window_exec(
             sorted_batches(10_000),
             InputOrderMode::Sorted,
+            &["pk"],
             vec![sort_expr("pk"), sort_expr("ts")],
             &range_frame(),
             &[count()],

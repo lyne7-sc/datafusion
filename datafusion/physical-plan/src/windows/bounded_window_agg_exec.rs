@@ -907,6 +907,33 @@ impl LinearSearch {
         }
     }
 
+    /// Compares a partition key with a row without constructing a temporary key.
+    fn partition_key_matches_row(
+        key: &PartitionKey,
+        columns: &[ArrayRef],
+        row_idx: usize,
+    ) -> bool {
+        key.iter().zip(columns).all(|(value, column)| match value {
+            // NullArray has no physical null bitmap. Encoded values can contain
+            // it recursively, so retain scalar equality for these types.
+            ScalarValue::Null
+            | ScalarValue::Dictionary(..)
+            | ScalarValue::Union(..)
+            | ScalarValue::RunEndEncoded(..) => {
+                *value == ScalarValue::try_from_array(column, row_idx).unwrap()
+            }
+            // List scalar construction can normalize element-field metadata.
+            ScalarValue::List(..)
+            | ScalarValue::LargeList(..)
+            | ScalarValue::FixedSizeList(..)
+            | ScalarValue::ListView(..)
+            | ScalarValue::LargeListView(..) => {
+                *value == ScalarValue::try_from_array(column, row_idx).unwrap()
+            }
+            _ => value.eq_array(column, row_idx).unwrap(),
+        })
+    }
+
     /// Splits the rows of `batch` by partition, according to the PARTITION BY
     /// expression results in `columns`. Returns the distinct partition keys
     /// in first-appearance order, a permutation of the row indices of
@@ -932,9 +959,11 @@ impl LinearSearch {
         let mut counts: Vec<usize> = vec![];
         for (hash, row_idx) in batch_hashes.into_iter().zip(0u32..) {
             let entry = self.row_map_batch.find_mut(hash, |(_, group_idx)| {
-                let row = get_row_at_idx(columns, row_idx as usize).unwrap();
-                // Handle hash collisions with an equality check:
-                row == keys[*group_idx]
+                Self::partition_key_matches_row(
+                    &keys[*group_idx],
+                    columns,
+                    row_idx as usize,
+                )
             });
             let group_idx = if let Some((_, group_idx)) = entry {
                 *group_idx
@@ -986,9 +1015,11 @@ impl LinearSearch {
         let mut partition_indices: Vec<(PartitionKey, Vec<u32>)> = vec![];
         for (hash, row_idx) in self.input_buffer_hashes.iter().zip(0u32..) {
             let entry = self.row_map_out.find_mut(*hash, |(_, group_idx, _)| {
-                let row =
-                    get_row_at_idx(&partition_by_columns, row_idx as usize).unwrap();
-                row == partition_indices[*group_idx].0
+                Self::partition_key_matches_row(
+                    &partition_indices[*group_idx].0,
+                    &partition_by_columns,
+                    row_idx as usize,
+                )
             });
             if let Some((_, group_idx, n_out)) = entry {
                 let (_, indices) = &mut partition_indices[*group_idx];
@@ -3136,6 +3167,188 @@ mod tests {
         // The whole batch belongs to one partition, so its columns are reused
         // rather than gathered into a new batch.
         assert!(Arc::ptr_eq(result[0].1.column(0), single.column(0)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_window_partition_key_lookup() -> Result<()> {
+        use arrow::array::{ArrayRef, Int32Array, ListArray, StringArray, UInt64Array};
+        use arrow::datatypes::Int32Type;
+
+        let strings: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("abcdefghijklmnop"),
+            None,
+            Some("abcdefghijklmnop"),
+            Some("qrstuvwxyzabcdef"),
+            None,
+            Some("qrstuvwxyzabcdef"),
+            Some("abcdefghijklmnop"),
+            None,
+            Some("abcdefghijklmnop"),
+            Some("qrstuvwxyzabcdef"),
+            None,
+            Some("qrstuvwxyzabcdef"),
+        ]));
+        // NULL and empty lists have the same hash. Repeated occurrences exercise
+        // collision resolution in both input grouping and output row lookup.
+        let lists: ArrayRef =
+            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+                [
+                    None,
+                    Some(vec![]),
+                    None,
+                    Some(vec![Some(1)]),
+                    Some(vec![]),
+                    Some(vec![Some(1)]),
+                ]
+                .into_iter()
+                .cycle()
+                .take(12),
+            ));
+        let views = arrow::compute::cast(&strings, &DataType::Utf8View)?;
+        for keys in [strings, views, lists] {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", keys.data_type().clone(), true),
+                Field::new("prefix", DataType::Int32, false),
+                Field::new("ts", DataType::UInt64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    keys,
+                    Arc::new(Int32Array::from(vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1])),
+                    Arc::new(UInt64Array::from_iter_values(0..12)),
+                ],
+            )?;
+            for mode in [
+                InputOrderMode::Linear,
+                InputOrderMode::PartiallySorted(vec![1]),
+            ] {
+                // Cross a sorted-prefix boundary inside a batch, and revisit keys
+                // across batches with nonzero array offsets.
+                let input = TestMemoryExec::try_new(
+                    &[vec![
+                        batch.slice(0, 3),
+                        batch.slice(3, 4),
+                        batch.slice(7, 5),
+                    ]],
+                    Arc::clone(&schema),
+                    None,
+                )?;
+                let mut ordering =
+                    vec![PhysicalSortExpr::new_default(col("ts", &schema)?)];
+                if matches!(mode, InputOrderMode::PartiallySorted(_)) {
+                    ordering.insert(
+                        0,
+                        PhysicalSortExpr::new_default(col("prefix", &schema)?),
+                    );
+                }
+                let input = input.try_with_sort_information(vec![
+                    LexOrdering::new(ordering).unwrap(),
+                ])?;
+                let input = Arc::new(TestMemoryExec::update_cache(&Arc::new(input)));
+                let window_expr = create_window_expr(
+                    &WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+                    "row_number".to_string(),
+                    &[],
+                    &[col("key", &schema)?, col("prefix", &schema)?],
+                    &[PhysicalSortExpr::new_default(col("ts", &schema)?)],
+                    Arc::new(WindowFrame::new(Some(false))),
+                    Arc::clone(&schema),
+                    false,
+                    false,
+                    None,
+                )?;
+                let plan =
+                    BoundedWindowAggExec::try_new(vec![window_expr], input, mode, true)?;
+                let output = collect(plan.execute(0, task_context())?).await?;
+                let output = arrow::compute::concat_batches(&plan.schema(), &output)?;
+                let expected = RecordBatch::try_new(
+                    plan.schema(),
+                    vec![
+                        Arc::clone(batch.column(0)),
+                        Arc::clone(batch.column(1)),
+                        Arc::clone(batch.column(2)),
+                        Arc::new(UInt64Array::from(vec![
+                            1, 1, 2, 1, 2, 2, 1, 1, 2, 1, 2, 2,
+                        ])),
+                    ],
+                )?;
+                assert_eq!(output, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partition_key_matches_scalar_equality() -> Result<()> {
+        use super::LinearSearch;
+        use arrow::array::{
+            ArrayRef, DictionaryArray, Int32Array, ListArray, NullArray, RunArray,
+            UnionArray,
+        };
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{Int32Type, UnionFields};
+        use datafusion_common::utils::get_row_at_idx;
+
+        let nulls: ArrayRef = Arc::new(NullArray::new(2));
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![Some(0), None, Some(1)]),
+            Arc::clone(&nulls),
+        )?;
+        let union = UnionArray::try_new(
+            UnionFields::try_new(
+                [0, 1],
+                [
+                    Field::new("null", DataType::Null, true),
+                    Field::new("int", DataType::Int32, true),
+                ],
+            )?,
+            vec![0, 1, 0, 1].into(),
+            Some(vec![0, 0, 1, 1].into()),
+            vec![
+                Arc::clone(&nulls),
+                Arc::new(Int32Array::from(vec![None, Some(1)])),
+            ],
+        )?;
+        let run = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![2, 4]),
+            nulls.as_ref(),
+        )?;
+        // List scalar construction normalizes element-field metadata, unlike
+        // slicing an array. Preserve the existing scalar-to-scalar comparison.
+        let list = ListArray::new(
+            Arc::new(
+                Field::new_list_field(DataType::Int32, false)
+                    .with_metadata([("key".to_string(), "value".to_string())]),
+            ),
+            OffsetBuffer::new(vec![0, 1, 2].into()),
+            Arc::new(Int32Array::from(vec![1, 1])),
+            None,
+        );
+        let arrays: Vec<ArrayRef> = vec![
+            nulls,
+            Arc::new(dictionary),
+            Arc::new(union),
+            Arc::new(run),
+            Arc::new(list),
+        ];
+        // Compare to the original scalar equality, including NULL values behind
+        // encodings and a union child with a different type.
+        let matches = arrays
+            .iter()
+            .map(|array| {
+                let columns = std::slice::from_ref(array);
+                (0..array.len()).all(|key_idx| {
+                    let key = get_row_at_idx(columns, key_idx).unwrap();
+                    (0..array.len()).all(|row_idx| {
+                        LinearSearch::partition_key_matches_row(&key, columns, row_idx)
+                            == (key == get_row_at_idx(columns, row_idx).unwrap())
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches, vec![true; arrays.len()]);
         Ok(())
     }
 }
