@@ -45,7 +45,7 @@ use arrow::compute::take_record_batch;
 use arrow::{
     array::{Array, ArrayRef, RecordBatchOptions, UInt32Array, UInt32Builder},
     compute::{concat, concat_batches, sort_to_indices, take_arrays},
-    datatypes::SchemaRef,
+    datatypes::{DataType, SchemaRef},
     record_batch::RecordBatch,
 };
 use datafusion_common::hash_utils::create_hashes;
@@ -932,9 +932,10 @@ impl LinearSearch {
         let mut counts: Vec<usize> = vec![];
         for (hash, row_idx) in batch_hashes.into_iter().zip(0u32..) {
             let entry = self.row_map_batch.find_mut(hash, |(_, group_idx)| {
-                let row = get_row_at_idx(columns, row_idx as usize).unwrap();
-                // Handle hash collisions with an equality check:
-                row == keys[*group_idx]
+                // Handle hash collisions with an equality check, without
+                // constructing a temporary partition key for every probe.
+                partition_key_matches_row(&keys[*group_idx], columns, row_idx as usize)
+                    .unwrap()
             });
             let group_idx = if let Some((_, group_idx)) = entry {
                 *group_idx
@@ -986,9 +987,12 @@ impl LinearSearch {
         let mut partition_indices: Vec<(PartitionKey, Vec<u32>)> = vec![];
         for (hash, row_idx) in self.input_buffer_hashes.iter().zip(0u32..) {
             let entry = self.row_map_out.find_mut(*hash, |(_, group_idx, _)| {
-                let row =
-                    get_row_at_idx(&partition_by_columns, row_idx as usize).unwrap();
-                row == partition_indices[*group_idx].0
+                partition_key_matches_row(
+                    &partition_indices[*group_idx].0,
+                    &partition_by_columns,
+                    row_idx as usize,
+                )
+                .unwrap()
             });
             if let Some((_, group_idx, n_out)) = entry {
                 let (_, indices) = &mut partition_indices[*group_idx];
@@ -1021,6 +1025,42 @@ impl LinearSearch {
         }
         Ok(partition_indices)
     }
+}
+
+/// Compare an existing partition key with a row without allocating a key vector.
+/// Encoded values and Null need scalar equality to preserve logical NULL semantics.
+fn partition_key_matches_row(
+    key: &PartitionKey,
+    columns: &[ArrayRef],
+    row_idx: usize,
+) -> Result<bool> {
+    debug_assert_eq!(key.len(), columns.len());
+    for (scalar, array) in key.iter().zip(columns) {
+        let matches = match array.data_type() {
+            DataType::Null
+            | DataType::Dictionary(_, _)
+            | DataType::Union(_, _)
+            | DataType::RunEndEncoded(_, _) => {
+                *scalar == ScalarValue::try_from_array(array, row_idx)?
+            }
+            // Scalar extraction rebuilds the list's element field without its
+            // metadata. eq_array compares against a slice that retains metadata.
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field)
+                if !field.metadata().is_empty() =>
+            {
+                *scalar == ScalarValue::try_from_array(array, row_idx)?
+            }
+            _ => scalar.eq_array(array, row_idx)?,
+        };
+        if !matches {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// This object encapsulates the algorithm state for sorted searching
@@ -3052,6 +3092,268 @@ mod tests {
             plan.cardinality_effect(),
             CardinalityEffect::Equal
         ));
+        Ok(())
+    }
+
+    /// Compare every pair, including sliced arrays, with the original scalar path.
+    #[test]
+    fn test_partition_key_matches_row() -> Result<()> {
+        use super::partition_key_matches_row;
+        use arrow::array::{
+            Array, ArrayRef, BooleanArray, Date32Array, DictionaryArray, Float64Array,
+            Int8Array, Int32Array, ListArray, NullArray, RunArray, StringArray,
+            StringViewArray, UInt64Array, UnionArray,
+        };
+        use arrow::datatypes::{Int8Type, Int32Type, UnionFields};
+
+        let strings = vec![
+            Some("abcdefghijklmnop"),
+            None,
+            Some("abcdefghijklmnop"),
+            Some("different string"),
+        ];
+        let list = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(1), None]),
+            None,
+            Some(vec![Some(1), None]),
+            Some(vec![Some(2)]),
+        ]);
+        let list_with_metadata = ListArray::new(
+            Arc::new(
+                Field::new_list_field(DataType::Int32, true)
+                    .with_metadata([("key".to_string(), "value".to_string())]),
+            ),
+            list.offsets().clone(),
+            Arc::clone(list.values()),
+            list.nulls().cloned(),
+        );
+        let values: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None]));
+        let dictionary = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(0), None, Some(0), Some(1)]),
+            values,
+        )?;
+        let run = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![1, 2, 3, 4]),
+            &StringArray::from(strings.clone()),
+        )?;
+        let union = UnionArray::try_new(
+            UnionFields::from_iter([
+                (0, Arc::new(Field::new("s", DataType::Utf8, true))),
+                (1, Arc::new(Field::new("i", DataType::Int32, true))),
+            ]),
+            vec![0, 0, 0, 1].into(),
+            None,
+            vec![
+                Arc::new(StringArray::from(strings.clone())),
+                Arc::new(Int32Array::from(vec![None, None, None, None])),
+            ],
+        )?;
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(strings.clone())),
+            Arc::new(StringViewArray::from(strings)),
+            Arc::new(UInt64Array::from(vec![Some(1), None, Some(1), Some(2)])),
+            Arc::new(Float64Array::from(vec![
+                Some(0.0),
+                None,
+                Some(-0.0),
+                Some(f64::NAN),
+            ])),
+            Arc::new(Date32Array::from(vec![Some(1), None, Some(1), Some(2)])),
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                None,
+                Some(true),
+                Some(false),
+            ])),
+            Arc::new(NullArray::new(4)),
+            Arc::new(dictionary),
+            Arc::new(union),
+            Arc::new(run),
+            Arc::new(list),
+            Arc::new(list_with_metadata),
+        ];
+        for array in arrays {
+            for columns in [vec![Arc::clone(&array)], vec![array.slice(1, 3)]] {
+                for key_idx in 0..columns[0].len() {
+                    let key =
+                        datafusion_common::utils::get_row_at_idx(&columns, key_idx)?;
+                    for row_idx in 0..columns[0].len() {
+                        assert_eq!(
+                            partition_key_matches_row(&key, &columns, row_idx)?,
+                            key == datafusion_common::utils::get_row_at_idx(
+                                &columns, row_idx
+                            )?,
+                            "type {:?}, key {key_idx}, row {row_idx}",
+                            array.data_type()
+                        );
+                    }
+                }
+            }
+        }
+        // Force collisions: equality must reject a different composite key even
+        // if the hash is identical, and accept the matching one.
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["a", "a", "b", "a"])),
+            Arc::new(Int32Array::from(vec![1, 2, 1, 1])),
+        ];
+        let keys = (0..3)
+            .map(|i| datafusion_common::utils::get_row_at_idx(&columns, i))
+            .collect::<Result<Vec<_>>>()?;
+        let mut table = hashbrown::HashTable::new();
+        for i in 0..3 {
+            table.insert_unique(0, i, |_| 0);
+        }
+        for (row, expected) in [0, 1, 2, 0].into_iter().enumerate() {
+            assert_eq!(
+                table.find(0, |i| partition_key_matches_row(&keys[*i], &columns, row)
+                    .unwrap()),
+                Some(&expected)
+            );
+        }
+        Ok(())
+    }
+
+    /// Keys recur across sliced batches; LEAD must wait for a later batch and
+    /// terminate each partition correctly, including at a sorted-prefix change.
+    #[tokio::test]
+    async fn test_partition_key_cross_batch_windows() -> Result<()> {
+        use arrow::array::{
+            ArrayRef, Int32Array, StringArray, StringViewArray, UInt64Array,
+        };
+        use arrow::compute::concat_batches;
+        for view in [false, true] {
+            for composite in [false, true] {
+                for partial in [false, true] {
+                    let n = 36;
+                    let strings: Vec<_> = (0..n)
+                        .map(|i| match i % 3 {
+                            0 => Some("abcdefghijklmnop"),
+                            1 => None,
+                            _ => Some("qrstuvwxyzabcdef"),
+                        })
+                        .collect();
+                    let pk: ArrayRef = if view {
+                        Arc::new(StringViewArray::from(strings))
+                    } else {
+                        Arc::new(StringArray::from(strings))
+                    };
+                    let schema = Arc::new(Schema::new(vec![
+                        Field::new("prefix", DataType::Int32, false),
+                        Field::new("pk", pk.data_type().clone(), true),
+                        Field::new("other", DataType::Int32, true),
+                        Field::new("ts", DataType::UInt64, false),
+                    ]));
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(Int32Array::from(
+                                (0..n).map(|i| (i / 18) as i32).collect::<Vec<_>>(),
+                            )),
+                            pk,
+                            Arc::new(Int32Array::from(
+                                (0..n)
+                                    .map(|i| if i % 2 == 0 { Some(0) } else { None })
+                                    .collect::<Vec<_>>(),
+                            )),
+                            Arc::new(UInt64Array::from_iter_values(0..n as u64)),
+                        ],
+                    )?;
+                    let batches = vec![
+                        batch.slice(0, 5),
+                        batch.slice(5, 8),
+                        batch.slice(13, 9),
+                        batch.slice(22, 14),
+                    ];
+                    let sort = |name| PhysicalSortExpr {
+                        expr: col(name, &schema).unwrap(),
+                        options: Default::default(),
+                    };
+                    let ordering = if partial {
+                        vec![sort("prefix"), sort("ts")]
+                    } else {
+                        vec![sort("ts")]
+                    };
+                    let source =
+                        TestMemoryExec::try_new(&[batches], Arc::clone(&schema), None)?
+                            .try_with_sort_information(
+                            LexOrdering::new(ordering).into_iter().collect(),
+                        )?;
+                    let input = Arc::new(TestMemoryExec::update_cache(&Arc::new(source)));
+                    let mut key_columns = vec![];
+                    if partial {
+                        key_columns.push(0);
+                    }
+                    key_columns.push(1);
+                    if composite {
+                        key_columns.push(2);
+                    }
+                    let partition_by = key_columns
+                        .iter()
+                        .map(|i| col(schema.field(*i).name(), &schema))
+                        .collect::<Result<Vec<_>>>()?;
+                    let order_by = vec![sort("ts")];
+                    let expressions = [
+                        (row_number_udwf(), "rn", vec![]),
+                        (lead_udwf(), "lead", vec![col("ts", &schema)?]),
+                    ]
+                    .into_iter()
+                    .map(|(fun, name, args)| {
+                        create_window_expr(
+                            &WindowFunctionDefinition::WindowUDF(fun),
+                            name.to_string(),
+                            &args,
+                            &partition_by,
+                            &order_by,
+                            Arc::new(WindowFrame::new(Some(false))),
+                            Arc::clone(&schema),
+                            false,
+                            false,
+                            None,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                    let mode = if partial {
+                        InputOrderMode::PartiallySorted(vec![0])
+                    } else {
+                        InputOrderMode::Linear
+                    };
+                    let plan =
+                        BoundedWindowAggExec::try_new(expressions, input, mode, true)?;
+                    let output =
+                        collect(plan.execute(0, Arc::new(TaskContext::default()))?)
+                            .await?;
+                    let output = concat_batches(&plan.schema(), &output)?;
+                    assert_eq!(output.num_rows(), n);
+                    let keys = (0..n)
+                        .map(|i| {
+                            key_columns
+                                .iter()
+                                .map(|c| ScalarValue::try_from_array(batch.column(*c), i))
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    for i in 0..n {
+                        assert_eq!(
+                            ScalarValue::try_from_array(output.column(3), i)?,
+                            ScalarValue::UInt64(Some(i as u64))
+                        );
+                        let rn = (0..=i).filter(|j| keys[*j] == keys[i]).count() as u64;
+                        let next =
+                            (i + 1..n).find(|j| keys[*j] == keys[i]).map(|j| j as u64);
+                        assert_eq!(
+                            ScalarValue::try_from_array(output.column(4), i)?,
+                            ScalarValue::UInt64(Some(rn)),
+                            "view={view}, composite={composite}, partial={partial}, row={i}"
+                        );
+                        assert_eq!(
+                            ScalarValue::try_from_array(output.column(5), i)?,
+                            ScalarValue::UInt64(next),
+                            "view={view}, composite={composite}, partial={partial}, row={i}"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

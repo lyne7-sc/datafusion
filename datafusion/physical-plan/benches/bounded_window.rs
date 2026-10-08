@@ -46,6 +46,8 @@
 //! - `linear sparse lead N partitions`: the sparse layout with a non-causal
 //!   function, whose result for the last buffered row of a partition stays
 //!   pending until that partition receives another row.
+//! - `linear dense row_number TYPE N partitions`: fixed key-type matrix with
+//!   16-byte strings and four-element lists, isolating partition-key lookup costs.
 //! - `linear dense rank N partitions`: the dense layout with an evaluator
 //!   that compares ORDER BY values row by row.
 //! - `sorted count N partitions`: control; input sorted by partition key,
@@ -54,7 +56,11 @@
 
 use std::sync::Arc;
 
-use arrow::array::UInt64Array;
+use arrow::array::{
+    ArrayRef, BooleanArray, Date32Array, Float64Array, ListArray, StringArray,
+    StringViewArray, UInt64Array,
+};
+use arrow::datatypes::Int32Type;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -109,6 +115,56 @@ fn make_batches(pk_of_row: impl Fn(usize) -> u64) -> Vec<RecordBatch> {
 /// batch (when `n_partitions <= BATCH_SIZE`).
 fn dense_batches(n_partitions: usize) -> Vec<RecordBatch> {
     make_batches(move |i| (i % n_partitions) as u64)
+}
+
+/// Fixed key-type matrix with the same dense layout and timing boundary.
+fn typed_dense_batches(data_type: &DataType, n_partitions: usize) -> Vec<RecordBatch> {
+    (0..N_BATCHES)
+        .map(|b| {
+            let start = b * BATCH_SIZE;
+            let groups = (start..start + BATCH_SIZE).map(|i| i % n_partitions);
+            let pk: ArrayRef = match data_type {
+                DataType::Utf8 => Arc::new(StringArray::from_iter_values(
+                    groups.map(|g| format!("{g:016}")),
+                )),
+                DataType::Utf8View => Arc::new(StringViewArray::from_iter_values(
+                    groups.map(|g| format!("{g:016}")),
+                )),
+                DataType::UInt64 => {
+                    Arc::new(UInt64Array::from_iter_values(groups.map(|g| g as u64)))
+                }
+                DataType::Float64 => {
+                    Arc::new(Float64Array::from_iter_values(groups.map(|g| g as f64)))
+                }
+                DataType::Date32 => {
+                    Arc::new(Date32Array::from_iter_values(groups.map(|g| g as i32)))
+                }
+                DataType::Boolean => {
+                    Arc::new(BooleanArray::from_iter(groups.map(|g| Some(g != 0))))
+                }
+                DataType::List(_) => {
+                    Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+                        groups.map(|g| Some(vec![Some(g as i32); 4])),
+                    ))
+                }
+                _ => unreachable!("unsupported benchmark key"),
+            };
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("pk", pk.data_type().clone(), false),
+                Field::new("ts", DataType::UInt64, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    pk,
+                    Arc::new(UInt64Array::from_iter_values(
+                        (start..start + BATCH_SIZE).map(|i| i as u64),
+                    )),
+                ],
+            )
+            .unwrap()
+        })
+        .collect()
 }
 
 /// Keys clustered in time: batch `b` only contains keys in
@@ -175,7 +231,7 @@ fn window_exec(
     window_frame: &WindowFrame,
     functions: &[BenchWindowFn],
 ) -> Arc<dyn ExecutionPlan> {
-    let schema = schema();
+    let schema = batches[0].schema();
     let source = TestMemoryExec::try_new(&[batches], Arc::clone(&schema), None)
         .expect("memory exec")
         .try_with_sort_information(LexOrdering::new(input_ordering).into_iter().collect())
@@ -372,6 +428,32 @@ fn bounded_window_benchmark(c: &mut Criterion) {
             &[rank()],
         ),
     );
+
+    for (key_name, data_type, n_partitions) in [
+        ("Utf8", DataType::Utf8, 100),
+        ("Utf8View", DataType::Utf8View, 100),
+        ("UInt64", DataType::UInt64, 100),
+        ("Float64", DataType::Float64, 100),
+        ("Date32", DataType::Date32, 100),
+        (
+            "List<Int32>",
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true))),
+            100,
+        ),
+        ("Boolean", DataType::Boolean, 2),
+        ("Utf8", DataType::Utf8, 10_000),
+    ] {
+        run_case(
+            format!("linear dense row_number {key_name} {n_partitions} partitions"),
+            window_exec(
+                typed_dense_batches(&data_type, n_partitions),
+                InputOrderMode::Linear,
+                vec![sort_expr("ts")],
+                &default_frame(),
+                &[row_number()],
+            ),
+        );
+    }
 
     // Control: the same query over partition-sorted input, where finished
     // partitions are pruned eagerly and the state maps stay small.
