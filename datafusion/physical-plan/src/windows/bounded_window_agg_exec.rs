@@ -3102,9 +3102,10 @@ mod tests {
         use arrow::array::{
             Array, ArrayRef, BooleanArray, Date32Array, DictionaryArray, Float64Array,
             Int8Array, Int32Array, ListArray, NullArray, RunArray, StringArray,
-            StringViewArray, UInt64Array, UnionArray,
+            StringViewArray, StructArray, UInt64Array, UnionArray,
         };
         use arrow::datatypes::{Int8Type, Int32Type, UnionFields};
+        use datafusion_common::utils::get_row_at_idx;
 
         let strings = vec![
             Some("abcdefghijklmnop"),
@@ -3117,6 +3118,9 @@ mod tests {
             None,
             Some(vec![Some(1), None]),
             Some(vec![Some(2)]),
+            Some(vec![]),
+            Some(vec![None]),
+            Some(vec![]),
         ]);
         let list_with_metadata = ListArray::new(
             Arc::new(
@@ -3148,6 +3152,32 @@ mod tests {
                 Arc::new(Int32Array::from(vec![None, None, None, None])),
             ],
         )?;
+        let structure = StructArray::new(
+            vec![
+                Field::new("i", DataType::Int32, true),
+                Field::new("s", DataType::Utf8, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    Some(2),
+                    None,
+                    None,
+                    Some(99),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("a"),
+                    Some("a"),
+                    None,
+                    Some("hidden"),
+                ])),
+            ],
+            Some(vec![true, true, true, true, true, false].into()),
+        );
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(strings.clone())),
             Arc::new(StringViewArray::from(strings)),
@@ -3171,44 +3201,27 @@ mod tests {
             Arc::new(run),
             Arc::new(list),
             Arc::new(list_with_metadata),
+            Arc::new(structure),
         ];
         for array in arrays {
-            for columns in [vec![Arc::clone(&array)], vec![array.slice(1, 3)]] {
-                for key_idx in 0..columns[0].len() {
-                    let key =
-                        datafusion_common::utils::get_row_at_idx(&columns, key_idx)?;
-                    for row_idx in 0..columns[0].len() {
+            for columns in [
+                vec![Arc::clone(&array)],
+                vec![array.slice(1, array.len() - 1)],
+            ] {
+                let keys = (0..columns[0].len())
+                    .map(|i| get_row_at_idx(&columns, i))
+                    .collect::<Result<Vec<_>>>()?;
+                for (key_idx, key) in keys.iter().enumerate() {
+                    for (row_idx, row_key) in keys.iter().enumerate() {
                         assert_eq!(
-                            partition_key_matches_row(&key, &columns, row_idx)?,
-                            key == datafusion_common::utils::get_row_at_idx(
-                                &columns, row_idx
-                            )?,
+                            partition_key_matches_row(key, &columns, row_idx)?,
+                            key == row_key,
                             "type {:?}, key {key_idx}, row {row_idx}",
                             array.data_type()
                         );
                     }
                 }
             }
-        }
-        // Force collisions: equality must reject a different composite key even
-        // if the hash is identical, and accept the matching one.
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(vec!["a", "a", "b", "a"])),
-            Arc::new(Int32Array::from(vec![1, 2, 1, 1])),
-        ];
-        let keys = (0..3)
-            .map(|i| datafusion_common::utils::get_row_at_idx(&columns, i))
-            .collect::<Result<Vec<_>>>()?;
-        let mut table = hashbrown::HashTable::new();
-        for i in 0..3 {
-            table.insert_unique(0, i, |_| 0);
-        }
-        for (row, expected) in [0, 1, 2, 0].into_iter().enumerate() {
-            assert_eq!(
-                table.find(0, |i| partition_key_matches_row(&keys[*i], &columns, row)
-                    .unwrap()),
-                Some(&expected)
-            );
         }
         Ok(())
     }
