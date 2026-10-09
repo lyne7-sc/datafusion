@@ -3371,6 +3371,93 @@ drop table annotated_data_finite2
 statement ok
 drop table annotated_data_infinite2
 
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    (0, 'abcdefghijklmnop', 1), (0, 'qrstuvwxyzabcdef', 2),
+    (0, 'abcdefghijklmnop', 3), (0, NULL, 4),
+    (0, 'qrstuvwxyzabcdef', 5), (0, NULL, 6),
+    (1, 'abcdefghijklmnop', 7), (1, 'qrstuvwxyzabcdef', 8),
+    (1, 'abcdefghijklmnop', 9), (1, NULL, 10),
+    (1, 'qrstuvwxyzabcdef', 11), (1, NULL, 12)
+  ) AS t(prefix, pk, ts) ORDER BY ts
+) TO 'test_files/scratch/window/partition_keys.csv' STORED AS CSV
+OPTIONS ('format.has_header' 'true');
+
+statement ok
+CREATE UNBOUNDED EXTERNAL TABLE partition_keys_linear (
+  prefix INTEGER, pk VARCHAR, ts INTEGER
+) STORED AS CSV WITH ORDER (ts)
+LOCATION 'test_files/scratch/window/partition_keys.csv'
+OPTIONS ('format.has_header' 'true');
+
+statement ok
+CREATE UNBOUNDED EXTERNAL TABLE partition_keys_partial (
+  prefix INTEGER, pk VARCHAR, ts INTEGER
+) STORED AS CSV WITH ORDER (prefix, ts)
+LOCATION 'test_files/scratch/window/partition_keys.csv'
+OPTIONS ('format.has_header' 'true');
+
+query TT
+EXPLAIN SELECT ts,
+  ROW_NUMBER() OVER (PARTITION BY prefix, pk ORDER BY ts) AS rn,
+  LEAD(ts) OVER (PARTITION BY prefix, pk ORDER BY ts) AS next_ts
+FROM partition_keys_linear;
+----
+<slt:ignore>BoundedWindowAggExec:<slt:ignore>mode=[Linear]<slt:ignore>
+
+query III
+SELECT ts,
+  ROW_NUMBER() OVER (PARTITION BY prefix, pk ORDER BY ts) AS rn,
+  LEAD(ts) OVER (PARTITION BY prefix, pk ORDER BY ts) AS next_ts
+FROM partition_keys_linear;
+----
+1 1 3
+2 1 5
+3 2 NULL
+4 1 6
+5 2 NULL
+6 2 NULL
+7 1 9
+8 1 11
+9 2 NULL
+10 1 12
+11 2 NULL
+12 2 NULL
+
+query TT
+EXPLAIN SELECT ts,
+  ROW_NUMBER() OVER (PARTITION BY prefix, pk ORDER BY ts) AS rn,
+  LEAD(ts) OVER (PARTITION BY prefix, pk ORDER BY ts) AS next_ts
+FROM partition_keys_partial;
+----
+<slt:ignore>BoundedWindowAggExec:<slt:ignore>mode=[PartiallySorted([0])]<slt:ignore>
+
+query III
+SELECT ts,
+  ROW_NUMBER() OVER (PARTITION BY prefix, pk ORDER BY ts) AS rn,
+  LEAD(ts) OVER (PARTITION BY prefix, pk ORDER BY ts) AS next_ts
+FROM partition_keys_partial;
+----
+1 1 3
+2 1 5
+3 2 NULL
+4 1 6
+5 2 NULL
+6 2 NULL
+7 1 9
+8 1 11
+9 2 NULL
+10 1 12
+11 2 NULL
+12 2 NULL
+
+statement ok
+DROP TABLE partition_keys_linear;
+
+statement ok
+DROP TABLE partition_keys_partial;
+
 # window3 spec is not used in window functions.
 # The query should still work.
 query IRR
