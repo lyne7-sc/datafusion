@@ -23,7 +23,7 @@
 //! live partition on every batch while never retiring partitions until the
 //! input is exhausted. The cases here stress that path in different ways.
 //!
-//! Case names spell out the input order mode (`linear` / `sorted`), the key
+//! Case names spell out the input order mode, the key
 //! layout (`dense` / `sparse`), the window functions, an optional frame
 //! variant, and the partition count:
 //!
@@ -48,6 +48,8 @@
 //!   pending until that partition receives another row.
 //! - `linear dense row_number TYPE N partitions`: fixed key-type matrix with
 //!   16-byte strings and four-element lists, isolating partition-key lookup costs.
+//! - `partially_sorted dense row_number TYPE N partitions per prefix`: keys
+//!   cycle within each sorted prefix, which spans four batches before changing.
 //! - `linear dense rank N partitions`: the dense layout with an evaluator
 //!   that compares ORDER BY values row by row.
 //! - `sorted count N partitions`: control; input sorted by partition key,
@@ -167,6 +169,28 @@ fn typed_dense_batches(data_type: &DataType, n_partitions: usize) -> Vec<RecordB
         .collect()
 }
 
+/// Four sorted prefixes, each spanning four batches of round-robin keys.
+fn partially_sorted_batches(
+    data_type: &DataType,
+    partitions_per_prefix: usize,
+) -> Vec<RecordBatch> {
+    typed_dense_batches(data_type, partitions_per_prefix)
+        .into_iter()
+        .enumerate()
+        .map(|(b, batch)| {
+            RecordBatch::try_from_iter([
+                ("pk", Arc::clone(batch.column(0))),
+                ("ts", Arc::clone(batch.column(1))),
+                (
+                    "prefix",
+                    Arc::new(UInt64Array::from(vec![(b / 4) as u64; BATCH_SIZE])),
+                ),
+            ])
+            .unwrap()
+        })
+        .collect()
+}
+
 /// Keys clustered in time: batch `b` only contains keys in
 /// `[b * SPARSE_KEYS_PER_BATCH, (b + 1) * SPARSE_KEYS_PER_BATCH)`, cycled so
 /// that consecutive rows belong to different partitions. Previously-seen
@@ -222,7 +246,7 @@ type BenchWindowFn = (
     Vec<Arc<dyn PhysicalExpr>>,
 );
 
-/// `<fn>(<args>) OVER (PARTITION BY pk ORDER BY ts <window_frame>)` for each
+/// `<fn>(<args>) OVER (PARTITION BY [prefix,] pk ORDER BY ts <window_frame>)` for each
 /// window function in `functions`.
 fn window_exec(
     batches: Vec<RecordBatch>,
@@ -237,7 +261,10 @@ fn window_exec(
         .try_with_sort_information(LexOrdering::new(input_ordering).into_iter().collect())
         .expect("sort information");
     let input = Arc::new(TestMemoryExec::update_cache(&Arc::new(source)));
-    let partitionby_exprs = vec![col("pk", &schema).unwrap()];
+    let mut partitionby_exprs = vec![col("pk", &schema).unwrap()];
+    if matches!(mode, InputOrderMode::PartiallySorted(_)) {
+        partitionby_exprs.insert(0, col("prefix", &schema).unwrap());
+    }
     let orderby_exprs = vec![PhysicalSortExpr {
         expr: col("ts", &schema).unwrap(),
         options: Default::default(),
@@ -449,6 +476,34 @@ fn bounded_window_benchmark(c: &mut Criterion) {
                 typed_dense_batches(&data_type, n_partitions),
                 InputOrderMode::Linear,
                 vec![sort_expr("ts")],
+                &default_frame(),
+                &[row_number()],
+            ),
+        );
+    }
+
+    for (key_name, data_type, partitions_per_prefix) in [
+        ("Utf8", DataType::Utf8, 100),
+        ("Utf8View", DataType::Utf8View, 100),
+        ("UInt64", DataType::UInt64, 100),
+        ("Utf8", DataType::Utf8, 10_000),
+    ] {
+        let batches = partially_sorted_batches(&data_type, partitions_per_prefix);
+        let ordering = vec![
+            PhysicalSortExpr {
+                expr: col("prefix", &batches[0].schema()).unwrap(),
+                options: Default::default(),
+            },
+            sort_expr("ts"),
+        ];
+        run_case(
+            format!(
+                "partially_sorted dense row_number {key_name} {partitions_per_prefix} partitions per prefix"
+            ),
+            window_exec(
+                batches,
+                InputOrderMode::PartiallySorted(vec![0]),
+                ordering,
                 &default_frame(),
                 &[row_number()],
             ),
