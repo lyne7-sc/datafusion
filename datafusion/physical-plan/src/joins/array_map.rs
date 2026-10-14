@@ -235,6 +235,61 @@ impl ArrayMap {
         Ok(())
     }
 
+    /// Whether all non-NULL build keys are unique. NULLs do not enter the map.
+    pub fn has_unique_keys(&self) -> bool {
+        self.next.is_empty()
+    }
+
+    /// Collects matching (`matched = true`) or unmatched probe row numbers in
+    /// `range`, returning the number of matching rows for join metrics.
+    /// Each probe row is emitted at most once, even with duplicate build keys.
+    pub fn get_existence_indices(
+        &self,
+        probe_side_keys: &[ArrayRef],
+        range: std::ops::Range<usize>,
+        matched: bool,
+        probe_indices: &mut Vec<u32>,
+    ) -> Result<usize> {
+        if probe_side_keys.len() != 1 {
+            return internal_err!(
+                "ArrayMap expects 1 join key, but got {}",
+                probe_side_keys.len()
+            );
+        }
+        let array = &probe_side_keys[0];
+        if range.start > range.end || range.end > array.len() {
+            return internal_err!("ArrayMap probe range is out of bounds");
+        }
+        downcast_supported_integer!(array.data_type() => (
+            collect_existence_indices, self, array, range, matched, probe_indices
+        ))
+    }
+
+    fn collect_existence_indices<T: ArrowNumericType>(
+        &self,
+        array: &ArrayRef,
+        range: std::ops::Range<usize>,
+        matched: bool,
+        probe_indices: &mut Vec<u32>,
+    ) -> Result<usize>
+    where
+        T::Native: AsPrimitive<u64>,
+    {
+        probe_indices.clear();
+        let arr = array.as_primitive::<T>();
+        let have_null = arr.null_count() > 0;
+        let mut matches = 0;
+        for i in range {
+            let exists = (!have_null || arr.is_valid(i))
+                && self.get_value(arr.value(i).as_()).is_some();
+            matches += usize::from(exists);
+            if exists == matched {
+                probe_indices.push(i as u32);
+            }
+        }
+        Ok(matches)
+    }
+
     pub fn num_of_distinct_key(&self) -> usize {
         self.num_of_distinct_key
     }
@@ -424,6 +479,69 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::array::UInt64Array;
     use std::sync::Arc;
+
+    #[test]
+    fn test_unique_keys_ignore_build_nulls() -> Result<()> {
+        for (keys, unique) in [
+            (vec![Some(-2), None, Some(2), None], true),
+            (vec![Some(-2), None, Some(-2), None], false),
+            (vec![None, None], true),
+        ] {
+            let build: ArrayRef = Arc::new(Int32Array::from(keys));
+            assert_eq!(
+                ArrayMap::try_new(&build, (-2_i64) as u64, 2)?.has_unique_keys(),
+                unique
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_existence_indices_with_duplicates_nulls_and_slice() -> Result<()> {
+        let build: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(-2),
+            None,
+            Some(2),
+            Some(-2),
+            None,
+        ]));
+        let map = ArrayMap::try_new(&build, (-2_i64) as u64, 2)?;
+        let probe: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(99),
+            Some(-3),
+            Some(-2),
+            None,
+            Some(0),
+            Some(2),
+            Some(3),
+            Some(99),
+        ]));
+        let probe = [probe.slice(1, 6)];
+        let mut indices = Vec::with_capacity(16);
+        let ptr = indices.as_ptr();
+        for (matched, expected) in [(true, vec![1, 4]), (false, vec![0, 2, 3, 5])] {
+            let mut actual = Vec::new();
+            let mut hits = 0;
+            for start in (0..6).step_by(2) {
+                hits += map.get_existence_indices(
+                    &probe,
+                    start..start + 2,
+                    matched,
+                    &mut indices,
+                )?;
+                actual.extend_from_slice(&indices);
+                assert_eq!(indices.as_ptr(), ptr);
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(hits, 2);
+        }
+        assert_eq!(
+            map.get_existence_indices(&probe, 3..3, true, &mut indices)?,
+            0
+        );
+        assert!(indices.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn test_array_map_limit_offset_duplicate_elements() -> Result<()> {

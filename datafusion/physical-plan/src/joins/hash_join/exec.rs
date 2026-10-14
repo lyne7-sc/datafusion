@@ -3347,6 +3347,147 @@ mod tests {
     ) {
     }
 
+    /// 2 join types x 2 map choices x 2 duplicate choices x 2 build-NULL
+    /// choices x 2 probe-NULL choices x 2 batch sizes x 3 projections x
+    /// 3 fetch limits x 3 hit patterns = 1728 execution configurations.
+    #[tokio::test]
+    async fn array_map_right_existence() -> Result<()> {
+        let mut cases = 0;
+        for (
+            join_type,
+            use_array_map,
+            duplicates,
+            build_nulls,
+            probe_nulls,
+            batch_size,
+            projection,
+            fetch,
+            pattern,
+        ) in itertools::iproduct!(
+            [JoinType::RightSemi, JoinType::RightAnti],
+            [true, false],
+            [true, false],
+            [true, false],
+            [true, false],
+            [1, 4],
+            [None, Some(vec![]), Some(vec![1, 0])],
+            [None, Some(0), Some(3)],
+            0..3,
+        ) {
+            let mut build_keys = vec![Some(-2), Some(0), Some(2)];
+            if duplicates {
+                build_keys.push(Some(0));
+            }
+            if build_nulls {
+                build_keys.extend([None, None]);
+            }
+            let mut probe_keys: Vec<Option<i32>> = match pattern {
+                0 => vec![-2, 0, 2, -2, 0, 2, -2, 0, 2],
+                1 => vec![-3, -1, 1, -3, -1, 1, -3, -1, 1],
+                _ => vec![-2, -1, 2, 0, 3, -3, -2, 0, 2],
+            }
+            .into_iter()
+            .map(Some)
+            .collect();
+            if probe_nulls {
+                probe_keys[1] = None;
+                probe_keys[7] = None;
+            }
+            let payload: Vec<_> = (0..probe_keys.len()).map(|i| Some(i as i32)).collect();
+            let left =
+                build_table_two_cols(("key", &build_keys), ("payload", &build_keys));
+            let probe_schema = left.schema();
+            let probe_batch = RecordBatch::try_new(
+                Arc::clone(&probe_schema),
+                vec![
+                    Arc::new(Int32Array::from(probe_keys.clone())),
+                    Arc::new(Int32Array::from(payload.clone())),
+                ],
+            )?;
+            // Exercise chunked lookup and the transition to a second input batch.
+            let right = TestMemoryExec::try_new_exec(
+                &[vec![probe_batch.slice(0, 5), probe_batch.slice(5, 4)]],
+                probe_schema,
+                None,
+            )?;
+            let on = vec![(
+                Arc::new(Column::new("key", 0)) as _,
+                Arc::new(Column::new("key", 0)) as _,
+            )];
+            let join = HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &join_type,
+                projection.clone(),
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?
+            .builder()
+            .with_fetch(fetch)
+            .build()?;
+            let batches = common::collect(
+                join.execute(0, prepare_task_ctx(batch_size, use_array_map))?,
+            )
+            .await?;
+            let matches: Vec<_> = probe_keys
+                .iter()
+                .map(|key| key.is_some() && build_keys.contains(key))
+                .collect();
+            let expected: Vec<_> = (0..probe_keys.len())
+                .filter(|&i| matches[i] == (join_type == JoinType::RightSemi))
+                .take(fetch.unwrap_or(usize::MAX))
+                .collect();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                expected.len()
+            );
+            let projected = projection.unwrap_or_else(|| vec![0, 1]);
+            for (output_col, input_col) in projected.iter().enumerate() {
+                let actual: Vec<_> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch.column(output_col).as_primitive::<Int32Type>().iter()
+                    })
+                    .collect();
+                let input = if *input_col == 0 {
+                    &probe_keys
+                } else {
+                    &payload
+                };
+                assert_eq!(
+                    actual,
+                    expected.iter().map(|&i| input[i]).collect::<Vec<_>>()
+                );
+            }
+            // The existing anti-join alignment can emit an entire unmatched
+            // range. The direct existence path bounds each materialized chunk.
+            if use_array_map && !duplicates {
+                assert!(batches.iter().all(|batch| batch.num_rows() <= batch_size));
+            }
+            let metrics = join.metrics().unwrap();
+            if fetch != Some(0) {
+                assert_phj_used(&metrics, use_array_map);
+            }
+            assert_eq!(metrics.output_rows().unwrap_or(0), expected.len());
+            if fetch.is_none() {
+                let hits = matches.iter().filter(|&&hit| hit).count();
+                let pairs = probe_keys
+                    .iter()
+                    .filter(|key| key.is_some())
+                    .map(|key| build_keys.iter().filter(|build| *build == key).count())
+                    .sum();
+                assert_ratio_metric(&metrics, "probe_hit_rate", hits, probe_keys.len());
+                assert_ratio_metric(&metrics, "avg_fanout", pairs, hits);
+            }
+            cases += 1;
+        }
+        assert_eq!(cases, 1728);
+        Ok(())
+    }
+
     fn prepare_task_ctx(
         batch_size: usize,
         use_perfect_hash_join_as_possible: bool,

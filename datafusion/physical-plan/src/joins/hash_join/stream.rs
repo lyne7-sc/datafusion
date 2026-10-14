@@ -49,7 +49,7 @@ use crate::{
 use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::datatypes::{Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, internal_datafusion_err, internal_err,
 };
@@ -886,6 +886,46 @@ impl HashJoinStream {
             return Ok(StatefulStreamResult::Continue);
         }
 
+        if let Some(array_map) = array_map_right_existence(
+            build_side.left_data.map(),
+            self.join_type,
+            self.filter.is_some(),
+            self.null_aware.is_some(),
+        ) {
+            let start = state.offset.0;
+            let end = start
+                .saturating_add(self.batch_size)
+                .min(state.batch.num_rows());
+            let matched = array_map.get_existence_indices(
+                &state.values,
+                start..end,
+                self.join_type == JoinType::RightSemi,
+                &mut self.probe_indices_buffer,
+            )?;
+            self.join_metrics.probe_hit_rate.add_part(matched);
+            self.join_metrics.avg_fanout.add_part(matched);
+            self.join_metrics.avg_fanout.add_total(matched);
+
+            let indices = UInt32Array::from(self.probe_indices_buffer.clone());
+            let batch = project_probe_batch(
+                &self.schema,
+                &state.batch,
+                &indices,
+                &self.column_indices,
+            )?;
+            let push_status = self.output_buffer.push_batch(batch)?;
+            timer.done();
+            if push_status == PushBatchStatus::LimitReached {
+                self.output_buffer.finish()?;
+                self.state = HashJoinStreamState::Completed;
+            } else if end == state.batch.num_rows() {
+                self.state = HashJoinStreamState::FetchProbeBatch;
+            } else {
+                state.advance((end, None), None);
+            }
+            return Ok(StatefulStreamResult::Continue);
+        }
+
         // get the matched by join keys indices
         let (left_indices, right_indices, next_offset) = match build_side.left_data.map()
         {
@@ -1176,6 +1216,55 @@ impl HashJoinStream {
 
         Ok(StatefulStreamResult::Continue)
     }
+}
+
+/// Direct existence probing is valid when each match has fanout one and no
+/// residual predicate or null-aware semantics need build-side row information.
+fn array_map_right_existence(
+    map: &Map,
+    join_type: JoinType,
+    has_filter: bool,
+    null_aware: bool,
+) -> Option<&crate::joins::array_map::ArrayMap> {
+    match map {
+        Map::ArrayMap(map)
+            if matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
+                && !has_filter
+                && !null_aware
+                && map.has_unique_keys() =>
+        {
+            Some(map)
+        }
+        _ => None,
+    }
+}
+
+/// Materializes probe-only output, reusing columns when every probe row survives.
+/// Existence indices contain each selected probe row once, in input order.
+fn project_probe_batch(
+    schema: &SchemaRef,
+    probe: &RecordBatch,
+    indices: &UInt32Array,
+    column_indices: &[ColumnIndex],
+) -> Result<RecordBatch> {
+    let keep_all = indices.len() == probe.num_rows();
+    let columns = column_indices
+        .iter()
+        .map(|ci| {
+            debug_assert_eq!(ci.side, JoinSide::Right);
+            let column = probe.column(ci.index);
+            if keep_all {
+                Ok(Arc::clone(column))
+            } else {
+                Ok(arrow::compute::take(column.as_ref(), indices, None)?)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(indices.len())),
+    )?)
 }
 
 /// Returns the next chunk of final build-side indices for join types that
@@ -1500,10 +1589,13 @@ impl Stream for HashJoinStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::joins::array_map::ArrayMap;
     use crate::joins::hash_join::shared_bounds::{
         PushdownStrategy, completed_partitions_for_test,
         make_partitioned_accumulator_for_test,
     };
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field};
 
     fn empty_build_data(partition_id: usize) -> PartitionBuildData {
         PartitionBuildData::Partitioned {
@@ -1567,5 +1659,85 @@ mod tests {
         handle.cancel_pending();
 
         assert_eq!(handle.state(), &BuildReportState::Finalized);
+    }
+
+    #[test]
+    fn existence_path_requires_unique_keys_without_filter_or_null_awareness() -> Result<()>
+    {
+        for (keys, unique) in [
+            (vec![Some(1), None, None], true),
+            (vec![Some(1), Some(1)], false),
+        ] {
+            let keys: ArrayRef = Arc::new(Int32Array::from(keys));
+            let map = Map::ArrayMap(ArrayMap::try_new(&keys, 1, 1)?);
+            for join_type in [JoinType::RightSemi, JoinType::RightAnti, JoinType::Inner] {
+                for has_filter in [false, true] {
+                    for null_aware in [false, true] {
+                        assert_eq!(
+                            array_map_right_existence(
+                                &map, join_type, has_filter, null_aware
+                            )
+                            .is_some(),
+                            unique
+                                && !has_filter
+                                && !null_aware
+                                && join_type != JoinType::Inner
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn project_probe_batch_reuses_all_rows_and_preserves_projection() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("payload", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )?;
+        for projection in [vec![], vec![1, 0], vec![1, 1]] {
+            let projected_schema = Arc::new(schema.project(&projection)?);
+            let columns: Vec<_> = projection
+                .iter()
+                .map(|&index| ColumnIndex {
+                    index,
+                    side: JoinSide::Right,
+                })
+                .collect();
+            let output = project_probe_batch(
+                &projected_schema,
+                &batch,
+                &UInt32Array::from(vec![0, 1, 2]),
+                &columns,
+            )?;
+            assert_eq!(output.num_rows(), 3);
+            for (i, &input) in projection.iter().enumerate() {
+                assert!(Arc::ptr_eq(output.column(i), batch.column(input)));
+            }
+            let output = project_probe_batch(
+                &projected_schema,
+                &batch,
+                &UInt32Array::from(vec![0, 2]),
+                &columns,
+            )?;
+            assert_eq!(output.num_rows(), 2);
+            for (i, &input) in projection.iter().enumerate() {
+                let expected = arrow::compute::take(
+                    batch.column(input).as_ref(),
+                    &UInt32Array::from(vec![0, 2]),
+                    None,
+                )?;
+                assert_eq!(output.column(i).as_ref(), expected.as_ref());
+            }
+        }
+        Ok(())
     }
 }

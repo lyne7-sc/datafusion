@@ -442,5 +442,107 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hash_join_semi_anti);
+/// End-to-end in-memory joins with unique dense build keys. Hits are spread
+/// through the probe stream or concentrated at its front/back.
+fn bench_array_map_right_existence(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let s = schema();
+    let mut group = c.benchmark_group("array_map_right_existence");
+    for build_rows in [1_000, 10_000, 100_000] {
+        let probe_rows = build_rows * 10;
+        let left_batches = build_batches(build_rows, build_rows, 0, &s);
+        for hit_percent in [0, 10, 50, 100] {
+            for position in ["spread", "front", "back"] {
+                // At 0% and 100%, position does not change the workload.
+                if matches!(hit_percent, 0 | 100) && position != "spread" {
+                    continue;
+                }
+                let hits = probe_rows * hit_percent / 100;
+                let keys = (0..probe_rows)
+                    .map(|i| {
+                        let hit = match position {
+                            "front" => i < hits,
+                            "back" => i >= probe_rows - hits,
+                            _ => i % 100 < hit_percent,
+                        };
+                        (i % build_rows + if hit { 0 } else { build_rows }) as i32
+                    })
+                    .collect::<Vec<_>>();
+                let mut right_batches = build_batches(probe_rows, probe_rows, 0, &s);
+                let keys = Int32Array::from(keys);
+                let mut offset = 0;
+                for batch in &mut right_batches {
+                    let mut columns = batch.columns().to_vec();
+                    columns[0] = Arc::new(keys.slice(offset, batch.num_rows()));
+                    offset += batch.num_rows();
+                    *batch = RecordBatch::try_new(Arc::clone(&s), columns).unwrap();
+                }
+                for join_type in [JoinType::RightSemi, JoinType::RightAnti] {
+                    let make_join = || {
+                        let left = make_exec(&left_batches, &s);
+                        let right = make_exec(&right_batches, &s);
+                        Arc::new(
+                            HashJoinExec::try_new(
+                                left,
+                                right,
+                                vec![(col("key", &s).unwrap(), col("key", &s).unwrap())],
+                                None,
+                                &join_type,
+                                None,
+                                PartitionMode::CollectLeft,
+                                NullEquality::NullEqualsNothing,
+                                false,
+                            )
+                            .unwrap(),
+                        )
+                    };
+                    // Validate outside timing, including the actual selected map.
+                    let join = make_join();
+                    let result = rt
+                        .block_on(collect(join.clone(), Arc::new(TaskContext::default())))
+                        .unwrap();
+                    let expected = if join_type == JoinType::RightSemi {
+                        hits
+                    } else {
+                        probe_rows - hits
+                    };
+                    assert_eq!(
+                        result.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                        expected
+                    );
+                    assert_eq!(
+                        datafusion_physical_plan::ExecutionPlan::metrics(join.as_ref())
+                            .unwrap()
+                            .sum_by_name("array_map_created_count")
+                            .unwrap()
+                            .as_usize(),
+                        1
+                    );
+                    group.bench_function(
+                        BenchmarkId::new(
+                            format!("{join_type}_h{hit_percent}_{position}"),
+                            build_rows,
+                        ),
+                        |b| {
+                            b.iter(|| {
+                                rt.block_on(collect(
+                                    make_join(),
+                                    Arc::new(TaskContext::default()),
+                                ))
+                                .unwrap()
+                            })
+                        },
+                    );
+                }
+            }
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_hash_join_semi_anti,
+    bench_array_map_right_existence
+);
 criterion_main!(benches);
